@@ -1,10 +1,11 @@
 [project]
 name = "scribe"
-version = "0.1.1"
+version = "0.1.2"
 description = "Jupyter Server + Notebooks for CLI Agents"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "click>=8.1.7",
     "fastmcp>=2.10.6",
     "ipykernel>=6.30.0",
     "jupyter-client>=8.6.3",
@@ -19,5 +20,5 @@ dependencies = [
 [project.scripts]
 scribe = "scribe.cli.cli:main"
 
-[tool.setuptools]
-packages = ["scribe"]
+[tool.setuptools.packages.find]
+include = ["scribe*"]
