@@ -19,5 +19,5 @@ dependencies = [
 [project.scripts]
 scribe = "scribe.cli.cli:main"
 
-[tool.setuptools]
-packages = ["scribe"]
+[tool.setuptools.packages.find]
+include = ["scribe*"]
