@@ -67,7 +67,12 @@ def copilot_impl(args=None, provider_name: str = DEFAULT_PROVIDER, verbose=False
             # Add any additional args passed to scribe copilot
             if args:
                 cmd.extend(args)
-            subprocess.run(cmd)
+            try:
+                subprocess.run(cmd)
+            finally:
+                # Clean up session-specific config files
+                settings_file.unlink(missing_ok=True)
+                mcp_config_file.unlink(missing_ok=True)
         elif provider_name == "gemini":
             # Get the settings from the provider
             settings_content = get_gemini_copilot_settings(python_path)
