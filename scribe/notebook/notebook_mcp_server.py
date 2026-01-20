@@ -5,11 +5,16 @@ raw HTTP requests or Jupyter Server API calls.
 """
 
 import atexit
+import hashlib
+import json
 import os
 import secrets
 import signal
 import subprocess
 import sys
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
 
 import requests
@@ -36,10 +41,149 @@ _server_token: Optional[str] = None
 # Down the line, we may wish to keep the Jupyter server around even after MCP server exits
 _is_external_server: bool = False
 
-SCRIBE_PROVIDER: str = os.environ.get("SCRIBE_PROVIDER")
+SCRIBE_PROVIDER: str | None = os.environ.get("SCRIBE_PROVIDER")
 
 # Session tracking for cleanup
 _active_sessions: set = set()
+
+
+# ============================================================================
+# State Persistence (for surviving Claude Code compaction)
+# ============================================================================
+
+
+def _get_state_file() -> Path:
+    """Get state file path unique to current working directory AND session.
+
+    This allows:
+    - Multiple Claude Code instances in different directories to have separate sessions
+    - Concurrent scribe sessions in the SAME directory to have separate state files
+    - Same session after compaction to reconnect to its own Jupyter server
+
+    Raises:
+        RuntimeError: If SCRIBE_SESSION_ID is not set (MCP server must be invoked via scribe CLI)
+    """
+    session_id = os.environ.get("SCRIBE_SESSION_ID")
+    if not session_id:
+        raise RuntimeError(
+            "SCRIBE_SESSION_ID environment variable is required. "
+            "The MCP server must be invoked via the scribe CLI (e.g., 'scribe claude'), "
+            "which sets this variable automatically."
+        )
+
+    cwd_hash = hashlib.md5(os.getcwd().encode()).hexdigest()[:8]
+    # Include first 8 chars of session_id for uniqueness
+    state_file = Path.home() / f".scribe_state_{cwd_hash}_{session_id[:8]}.json"
+    print(f"[scribe] Using state file: {state_file}", file=sys.stderr)
+    return state_file
+
+
+def save_state() -> None:
+    """Persist current MCP server state to disk for recovery after compaction.
+
+    Uses atomic write (write to temp file then rename) and sets restrictive
+    permissions (0o600) since the state file contains the Jupyter auth token.
+    """
+    global _server_port, _server_token, _server_url, _server_process, _active_sessions
+
+    state = {
+        "version": 1,
+        "server": {
+            "port": _server_port,
+            "token": _server_token,
+            "pid": _server_process.pid if _server_process else None,
+            "url": _server_url,
+        },
+        "sessions": list(_active_sessions),
+        "updated_at": datetime.now().isoformat(),
+    }
+    state_file = _get_state_file()
+    temp_file = state_file.with_suffix(".tmp")
+    try:
+        # Write to temp file first
+        temp_file.write_text(json.dumps(state, indent=2))
+        # Set restrictive permissions (owner read/write only) - token is sensitive
+        os.chmod(temp_file, 0o600)
+        # Atomic rename
+        os.replace(temp_file, state_file)
+    except IOError as e:
+        print(f"[scribe] Warning: Failed to save state: {e}", file=sys.stderr)
+        # Clean up temp file if it exists
+        try:
+            temp_file.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def load_state() -> dict | None:
+    """Load persisted state from disk if it exists."""
+    state_file = _get_state_file()
+    if state_file.exists():
+        try:
+            return json.loads(state_file.read_text())
+        except (json.JSONDecodeError, IOError):
+            return None
+    return None
+
+
+def clear_state() -> None:
+    """Remove state file (used when server is confirmed dead)."""
+    state_file = _get_state_file()
+    try:
+        if state_file.exists():
+            state_file.unlink()
+    except IOError:
+        pass
+
+
+class ServerStatus(Enum):
+    """Status of a Jupyter server health check."""
+
+    HEALTHY = "healthy"  # Server responded successfully
+    UNAUTHORIZED = "unauthorized"  # Server alive but rejected auth (401/403)
+    UNREACHABLE = "unreachable"  # Connection refused/timeout
+
+
+def check_jupyter_status(port: int, token: str) -> ServerStatus:
+    """Check Jupyter server status with auth differentiation.
+
+    Distinguishes between:
+    - HEALTHY: Server is responding and accepting our token
+    - UNAUTHORIZED: Server is alive but rejecting our token (401/403)
+    - UNREACHABLE: Server is not responding (connection refused, timeout, etc.)
+
+    This distinction is important because an UNAUTHORIZED response means the server
+    is still running (just with a different token), while UNREACHABLE means it's dead.
+    """
+    try:
+        headers = {"Authorization": f"token {token}"} if token else {}
+        response = requests.get(
+            f"http://127.0.0.1:{port}/api/scribe/health",
+            headers=headers,
+            timeout=2,
+        )
+        if response.status_code == 200:
+            return ServerStatus.HEALTHY
+        elif response.status_code in (401, 403):
+            return ServerStatus.UNAUTHORIZED
+        else:
+            return ServerStatus.UNREACHABLE
+    except requests.RequestException:
+        return ServerStatus.UNREACHABLE
+
+
+def is_jupyter_alive(port: int, token: str) -> bool:
+    """Check if a Jupyter server is responding at the given port with the given token.
+
+    This is a backwards-compatible wrapper around check_jupyter_status that returns
+    a simple boolean (True only if HEALTHY).
+    """
+    return check_jupyter_status(port, token) == ServerStatus.HEALTHY
+
+
+# ============================================================================
+# Server Management
+# ============================================================================
 
 
 def start_jupyter_server() -> tuple[subprocess.Popen, int, str]:
@@ -68,24 +212,74 @@ def cleanup_server():
     if _server_process and not _is_external_server:
         cleanup_scribe_server(_server_process)
         _server_process = None
-        _server_token = None  # Clear token on cleanup
+        _server_token = None
+        clear_state()  # Remove state file pointing to now-dead server
 
 
 def ensure_server_running() -> str:
     """Ensure a Jupyter server is running and return its URL."""
-    global _server_process, _server_port, _server_url, _is_external_server
+    global _server_process, _server_port, _server_url, _server_token, _is_external_server, _active_sessions
 
     # Check if SCRIBE_PORT is set (external server)
     if "SCRIBE_PORT" in os.environ:
         port = os.environ["SCRIBE_PORT"]
         _server_port = int(port)
         _server_url = f"http://127.0.0.1:{port}"
+        # Support SCRIBE_TOKEN for external server authentication
+        _server_token = os.environ.get("SCRIBE_TOKEN", "")
         _is_external_server = True
+
+        # Optionally verify external server is reachable
+        if _server_token:
+            status = check_jupyter_status(_server_port, _server_token)
+            if status != ServerStatus.HEALTHY:
+                print(
+                    f"[scribe] Warning: External server at port {port} returned {status.value}",
+                    file=sys.stderr,
+                )
+
         return _server_url
 
     # Check if our managed server is still running
     if _server_process and _server_process.poll() is None:
+        assert _server_url is not None  # Set when server started
         return _server_url
+
+    # Try to restore from persisted state (survives Claude Code compaction)
+    state = load_state()
+    if state and state.get("server", {}).get("port"):
+        saved_port = state["server"]["port"]
+        saved_token = state["server"]["token"]
+
+        if saved_token:
+            status = check_jupyter_status(saved_port, saved_token)
+            if status == ServerStatus.HEALTHY:
+                print(
+                    f"[scribe] Reconnected to existing Jupyter server at port {saved_port}",
+                    file=sys.stderr,
+                )
+                _server_port = saved_port
+                _server_token = saved_token
+                _server_url = f"http://127.0.0.1:{saved_port}"
+                _active_sessions = set(state.get("sessions", []))
+                _is_external_server = False  # We started it, but don't have process handle
+                # Note: _server_process stays None since we don't own the process handle anymore
+                return _server_url
+            elif status == ServerStatus.UNAUTHORIZED:
+                print(
+                    f"[scribe] Saved Jupyter server (port {saved_port}) rejected auth token, starting new one",
+                    file=sys.stderr,
+                )
+                clear_state()
+            else:  # UNREACHABLE
+                print(
+                    f"[scribe] Saved Jupyter server (port {saved_port}) is dead, starting new one",
+                    file=sys.stderr,
+                )
+                clear_state()
+        else:
+            # No token in saved state - clear and start fresh
+            clear_state()
 
     # Start a new managed server
     _is_external_server = False
@@ -93,10 +287,14 @@ def ensure_server_running() -> str:
 
     # Register cleanup handlers
     atexit.register(cleanup_server)
-    signal.signal(signal.SIGTERM, lambda sig, frame: cleanup_server())
-    signal.signal(signal.SIGINT, lambda sig, frame: cleanup_server())
+    signal.signal(signal.SIGTERM, lambda _sig, _frame: cleanup_server())
+    signal.signal(signal.SIGINT, lambda _sig, _frame: cleanup_server())
 
-    print(f"Started managed Jupyter server at {_server_url}", file=sys.stderr)
+    print(f"[scribe] Started managed Jupyter server at {_server_url}", file=sys.stderr)
+
+    # Persist state for recovery after compaction
+    save_state()
+
     return _server_url
 
 
@@ -195,6 +393,9 @@ async def _start_session_internal(
         # Track session for cleanup
         global _active_sessions
         _active_sessions.add(data["session_id"])
+
+        # Persist state for recovery after compaction
+        save_state()
 
         # Handle restoration results if present (only for notebook-based sessions)
         if notebook_path:
@@ -402,7 +603,7 @@ async def execute_code(
 
 
         # Create result list with execution metadata first, then images
-        result = [
+        result: list[Dict[str, Any] | Image] = [
             {
                 "session_id": session_id,
                 "execution_count": data["execution_count"],
@@ -495,7 +696,7 @@ async def edit_cell(
 
 
         # Create result list with execution metadata first, then images
-        result = [
+        result: list[Dict[str, Any] | Image] = [
             {
                 "session_id": session_id,
                 "cell_index": data["cell_index"],
@@ -533,8 +734,13 @@ async def shutdown_session(session_id: str) -> str:
         )
         response.raise_for_status()
 
-        # Clean up session images if image saving is enabled
+        # Clean up session tracking
         global _active_sessions
+        _active_sessions.discard(session_id)
+
+        # Persist state for recovery after compaction
+        save_state()
+
         return f"Session {session_id} shut down successfully"
 
     except requests.exceptions.RequestException as e:
