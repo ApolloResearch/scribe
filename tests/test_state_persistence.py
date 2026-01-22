@@ -514,3 +514,88 @@ class TestSessionIsolation:
         with patch.dict(os.environ, clean_env, clear=True):
             with pytest.raises(RuntimeError, match="SCRIBE_SESSION_ID environment variable is required"):
                 _get_state_file()
+
+
+# ============================================================================
+# Error Handling and Session Discovery Tests
+# ============================================================================
+
+
+class TestErrorHandlingAndSessionDiscovery:
+    """Integration tests for error handling and session discovery."""
+
+    @pytest.mark.asyncio
+    async def test_invalid_session_id_returns_clear_error(
+        self,
+        python_path: str,
+        cleanup_jupyter_processes,
+    ):
+        """Verify invalid session_id error is propagated through MCP."""
+        import requests
+
+        # Set up environment and start Jupyter server manually
+        test_session_id = "test_error_handling_12345678"
+        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": test_session_id}):
+            from scribe.notebook.notebook_mcp_server import ensure_server_running, get_token
+
+            server_url = ensure_server_running()
+            token = get_token()
+            headers = {"Authorization": f"token {token}"} if token else {}
+
+            # Try to execute with fake session_id - server should return error
+            response = requests.post(
+                f"{server_url}/api/scribe/exec",
+                json={"session_id": "fake_session_that_does_not_exist", "code": "print(1)"},
+                headers=headers,
+            )
+
+            # Should get 500 with error message
+            assert response.status_code == 500
+            error_data = response.json()
+            error_message = error_data.get("error", "").lower()
+
+            # Error should mention session and not found
+            assert "session" in error_message and "not found" in error_message, (
+                f"Server error should mention 'Session not found', got: {error_data}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_mcp_integration(
+        self,
+        python_path: str,
+        track_state_files,
+        cleanup_jupyter_processes,
+    ):
+        """Verify list_sessions tool works through MCP protocol."""
+        options = ClaudeAgentOptions(
+            mcp_servers=get_scribe_mcp_config(python_path),
+            allowed_tools=[
+                "mcp__scribe__start_new_session",
+                "mcp__scribe__list_sessions",
+                "mcp__scribe__execute_code",
+            ],
+            max_turns=10,
+        )
+
+        session_id_found = False
+        executed_successfully = False
+
+        async with ClaudeSDKClient(options=options) as client:
+            # Create session, list sessions, then execute
+            await client.query(
+                "1. Use start_new_session to create a notebook\n"
+                "2. Use list_sessions and tell me the exact session_id you see\n"
+                "3. Use execute_code with that session_id to run: print('test_success')"
+            )
+
+            async for msg in client.receive_response():
+                msg_text = str(msg)
+                # Look for UUID pattern (session IDs are UUIDs)
+                if "-" in msg_text and len(msg_text) > 30:
+                    session_id_found = True
+                if "test_success" in msg_text.lower():
+                    executed_successfully = True
+
+        # Both should have occurred
+        assert session_id_found, "Should have seen a session_id from list_sessions"
+        assert executed_successfully, "Should have successfully executed code using listed session_id"

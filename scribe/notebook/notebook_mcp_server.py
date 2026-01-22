@@ -33,6 +33,29 @@ from scribe.notebook._notebook_server_utils import (
 # Initialize MCP server
 mcp = FastMCP("scribe")
 
+
+def _check_response(response: requests.Response, operation: str) -> dict:
+    """Check HTTP response and return JSON data, raising with server error message on failure.
+
+    Args:
+        response: The requests Response object
+        operation: Description of the operation for error messages (e.g., "start session")
+
+    Returns:
+        The JSON response data
+
+    Raises:
+        Exception: With the actual server error message if request failed
+    """
+    if not response.ok:
+        try:
+            error_data = response.json()
+            error_msg = error_data.get("error", response.text)
+        except Exception:
+            error_msg = response.text or f"HTTP {response.status_code}"
+        raise Exception(f"Failed to {operation}: {error_msg}")
+    return response.json()
+
 # Global server management
 _server_process: Optional[subprocess.Popen] = None
 _server_port: Optional[int] = None
@@ -376,8 +399,7 @@ async def _start_session_internal(
         response = requests.post(
             f"{server_url}/api/scribe/start", json=request_body, headers=headers
         )
-        response.raise_for_status()
-        data = response.json()
+        data = _check_response(response, "start session")
 
         result = {
             "session_id": data["session_id"],
@@ -570,8 +592,12 @@ async def execute_code(
     Images generated during execution (e.g., via .show()) are returned as
     fastmcp.Image objects that can be directly viewed.
 
+    IMPORTANT: Sessions persist across context compaction. If you lose your session_id
+    (e.g., after compaction), use list_sessions to find active sessions you can continue using.
+    You do NOT need to resume the notebook - just use the session_id from list_sessions.
+
     Args:
-        session_id: The session ID returned by start_session
+        session_id: The session ID returned by start_session (or from list_sessions)
         code: Python code to execute
 
     Returns:
@@ -591,8 +617,7 @@ async def execute_code(
             json={"session_id": session_id, "code": code},
             headers=headers,
         )
-        response.raise_for_status()
-        data = response.json()
+        data = _check_response(response, f"execute code in session {session_id}")
 
         # Process outputs using utils function
         outputs, images = process_jupyter_outputs(
@@ -639,8 +664,7 @@ async def add_markdown(session_id: str, content: str) -> Dict[str, int]:
             json={"session_id": session_id, "content": content},
             headers=headers,
         )
-        response.raise_for_status()
-        data = response.json()
+        data = _check_response(response, f"add markdown in session {session_id}")
 
 
         return {"cell_number": data["cell_number"]}
@@ -684,8 +708,7 @@ async def edit_cell(
             json={"session_id": session_id, "code": code, "cell_index": cell_index},
             headers=headers,
         )
-        response.raise_for_status()
-        data = response.json()
+        data = _check_response(response, f"edit cell in session {session_id}")
 
         # Process outputs using utils function
         outputs, images = process_jupyter_outputs(
@@ -732,7 +755,7 @@ async def shutdown_session(session_id: str) -> str:
             json={"session_id": session_id},
             headers=headers,
         )
-        response.raise_for_status()
+        _check_response(response, f"shutdown session {session_id}")
 
         # Clean up session tracking
         global _active_sessions
@@ -745,6 +768,29 @@ async def shutdown_session(session_id: str) -> str:
 
     except requests.exceptions.RequestException as e:
         raise Exception(f"Failed to shutdown session: {str(e)}")
+
+
+@mcp.tool
+async def list_sessions() -> Dict[str, Any]:
+    """
+    List all active notebook sessions.
+
+    Returns session IDs for all running sessions. Use this to find valid session_ids
+    for execute_code, add_markdown, edit_cell, etc.
+
+    IMPORTANT: Call this after context compaction if you've lost your session_id.
+    Sessions persist across compaction - you can continue using them without resuming
+    the notebook. Just get the session_id from this function and pass it to execute_code.
+
+    Returns:
+        Dictionary with:
+        - sessions: List of active session IDs (UUIDs)
+        - server_status: Current server status including URL and health
+    """
+    return {
+        "sessions": list(_active_sessions),
+        "server_status": get_server_status(),
+    }
 
 
 @mcp.resource(
