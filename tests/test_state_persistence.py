@@ -517,6 +517,136 @@ class TestSessionIsolation:
 
 
 # ============================================================================
+# Response Handling Unit Tests
+# ============================================================================
+
+
+class TestCheckResponse:
+    """Unit tests for _check_response() helper function."""
+
+    def test_check_response_success_with_json(self):
+        """Verify successful response with JSON returns parsed data."""
+        from scribe.notebook.notebook_mcp_server import _check_response  # type: ignore[attr-defined]
+
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.content = b'{"result": "success"}'
+        mock_response.json.return_value = {"result": "success"}
+
+        result = _check_response(mock_response, "test operation")
+        assert result == {"result": "success"}
+
+    def test_check_response_success_empty_content(self):
+        """Verify successful response with empty content returns empty dict."""
+        from scribe.notebook.notebook_mcp_server import _check_response  # type: ignore[attr-defined]
+
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.content = b""
+
+        result = _check_response(mock_response, "test operation")
+        assert result == {}
+
+    def test_check_response_success_non_json(self):
+        """Verify successful response with non-JSON returns empty dict."""
+        from scribe.notebook.notebook_mcp_server import _check_response  # type: ignore[attr-defined]
+
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.content = b"plain text response"
+        mock_response.json.side_effect = ValueError("Not JSON")
+
+        result = _check_response(mock_response, "test operation")
+        assert result == {}
+
+    def test_check_response_error_with_error_field(self):
+        """Verify error response extracts 'error' field from JSON."""
+        from scribe.notebook.notebook_mcp_server import _check_response  # type: ignore[attr-defined]
+
+        mock_response = MagicMock()
+        mock_response.ok = False
+        mock_response.status_code = 500
+        mock_response.json.return_value = {"error": "Session not found"}
+        mock_response.text = '{"error": "Session not found"}'
+
+        with pytest.raises(Exception) as exc_info:
+            _check_response(mock_response, "execute code")
+
+        error_msg = str(exc_info.value)
+        assert "Session not found" in error_msg
+        assert "HTTP 500" in error_msg
+        assert "execute code" in error_msg
+
+    def test_check_response_error_with_detail_field(self):
+        """Verify error response extracts 'detail' field from JSON."""
+        from scribe.notebook.notebook_mcp_server import _check_response  # type: ignore[attr-defined]
+
+        mock_response = MagicMock()
+        mock_response.ok = False
+        mock_response.status_code = 400
+        mock_response.json.return_value = {"detail": "Invalid request"}
+        mock_response.text = '{"detail": "Invalid request"}'
+
+        with pytest.raises(Exception) as exc_info:
+            _check_response(mock_response, "test operation")
+
+        error_msg = str(exc_info.value)
+        assert "Invalid request" in error_msg
+        assert "HTTP 400" in error_msg
+
+    def test_check_response_error_with_message_field(self):
+        """Verify error response extracts 'message' field from JSON."""
+        from scribe.notebook.notebook_mcp_server import _check_response  # type: ignore[attr-defined]
+
+        mock_response = MagicMock()
+        mock_response.ok = False
+        mock_response.status_code = 403
+        mock_response.json.return_value = {"message": "Forbidden"}
+        mock_response.text = '{"message": "Forbidden"}'
+
+        with pytest.raises(Exception) as exc_info:
+            _check_response(mock_response, "test operation")
+
+        error_msg = str(exc_info.value)
+        assert "Forbidden" in error_msg
+        assert "HTTP 403" in error_msg
+
+    def test_check_response_error_non_json(self):
+        """Verify error response with non-JSON uses response text."""
+        from scribe.notebook.notebook_mcp_server import _check_response  # type: ignore[attr-defined]
+
+        mock_response = MagicMock()
+        mock_response.ok = False
+        mock_response.status_code = 500
+        mock_response.json.side_effect = ValueError("Not JSON")
+        mock_response.text = "Internal Server Error"
+
+        with pytest.raises(Exception) as exc_info:
+            _check_response(mock_response, "test operation")
+
+        error_msg = str(exc_info.value)
+        assert "Internal Server Error" in error_msg
+        assert "HTTP 500" in error_msg
+
+    def test_check_response_error_no_content(self):
+        """Verify error response with no content provides helpful message."""
+        from scribe.notebook.notebook_mcp_server import _check_response  # type: ignore[attr-defined]
+
+        mock_response = MagicMock()
+        mock_response.ok = False
+        mock_response.status_code = 500
+        mock_response.json.side_effect = ValueError("Not JSON")
+        mock_response.text = ""
+
+        with pytest.raises(Exception) as exc_info:
+            _check_response(mock_response, "test operation")
+
+        error_msg = str(exc_info.value)
+        assert "No error details" in error_msg
+        assert "HTTP 500" in error_msg
+
+
+# ============================================================================
 # Error Handling and Session Discovery Tests
 # ============================================================================
 

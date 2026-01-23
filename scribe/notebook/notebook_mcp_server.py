@@ -42,19 +42,35 @@ def _check_response(response: requests.Response, operation: str) -> dict:
         operation: Description of the operation for error messages (e.g., "start session")
 
     Returns:
-        The JSON response data
+        The JSON response data (empty dict if response has no content)
 
     Raises:
         Exception: With the actual server error message if request failed
     """
     if not response.ok:
+        # Try to extract error message from JSON with common error field names
         try:
             error_data = response.json()
-            error_msg = error_data.get("error", response.text)
+            # Check multiple common error fields
+            error_msg = (
+                error_data.get("error")
+                or error_data.get("detail")
+                or error_data.get("message")
+                or response.text
+            )
         except Exception:
-            error_msg = response.text or f"HTTP {response.status_code}"
-        raise Exception(f"Failed to {operation}: {error_msg}")
-    return response.json()
+            error_msg = response.text or "No error details"
+        raise Exception(f"Failed to {operation} (HTTP {response.status_code}): {error_msg}")
+
+    # Handle empty/non-JSON success responses (e.g., 204 No Content)
+    if not response.content:
+        return {}
+
+    try:
+        return response.json()
+    except Exception:
+        # If response isn't JSON, return empty dict rather than crashing
+        return {}
 
 # Global server management
 _server_process: Optional[subprocess.Popen] = None
@@ -782,14 +798,24 @@ async def list_sessions() -> Dict[str, Any]:
     Sessions persist across compaction - you can continue using them without resuming
     the notebook. Just get the session_id from this function and pass it to execute_code.
 
+    Note: Session IDs returned may include stale sessions if kernels have died. These
+    are best-effort and will fail gracefully if used.
+
     Returns:
         Dictionary with:
         - sessions: List of active session IDs (UUIDs)
-        - server_status: Current server status including URL and health
+        - server_status: Current server status (URL redacted for security)
     """
+    status = get_server_status()
+
+    # Redact auth token from vscode_url to prevent token leakage in logs/transcripts
+    if status.get("vscode_url") and "?token=" in status["vscode_url"]:
+        base_url = status["vscode_url"].split("?token=")[0]
+        status["vscode_url"] = f"{base_url}?token=<redacted>"
+
     return {
         "sessions": list(_active_sessions),
-        "server_status": get_server_status(),
+        "server_status": status,
     }
 
 
