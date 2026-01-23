@@ -34,6 +34,16 @@ class ClaudeProvider(AICLIProvider):
                     "command": python_path,
                     "args": ["-m", "scribe.notebook.notebook_mcp_server"],
                     "env": {
+                        # Session ID for state file isolation (allows concurrent sessions)
+                        **(
+                            {}
+                            if os.environ.get("SCRIBE_SESSION_ID") is None
+                            else {
+                                "SCRIBE_SESSION_ID": os.environ.get(
+                                    "SCRIBE_SESSION_ID"
+                                )
+                            }
+                        ),
                         # Location of notebook outputs - only include if set to avoid "null" string
                         **(
                             {}
@@ -43,7 +53,7 @@ class ClaudeProvider(AICLIProvider):
                                     "NOTEBOOK_OUTPUT_DIR"
                                 )
                             }
-                        )
+                        ),
                     },
                 }
             }
