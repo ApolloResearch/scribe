@@ -863,3 +863,295 @@ class TestServerFailureScenarios:
 
             status = mcp_server.get_server_status()
             assert status["is_external"] is True
+
+
+class TestSessionShutdownEdgeCases:
+    """Integration tests for session shutdown edge cases."""
+
+    # Note: cleanup_jupyter_processes fixture is used for side effects (cleanup after test),
+    # not accessed directly. Using underscore prefix to indicate intentional non-use.
+
+    @pytest.mark.asyncio
+    async def test_shutdown_session_twice_is_safe(
+        self,
+        reset_mcp_module,
+        cleanup_jupyter_processes,  # pyright: ignore[reportUnusedParameter]
+    ):
+        """Verify shutting down the same session twice doesn't crash."""
+        test_session_id = str(uuid.uuid4())
+        mcp_server = reset_mcp_module(test_session_id)
+
+        session_data, server_url, headers = start_session_via_http(mcp_server, "shutdown_twice_test")
+        session_id = session_data["session_id"]
+
+        # First shutdown should succeed
+        response1 = requests.post(
+            f"{server_url}/api/scribe/shutdown",
+            json={"session_id": session_id},
+            headers=headers,
+        )
+        assert response1.ok, f"First shutdown should succeed: {response1.text}"
+
+        # Second shutdown should not crash - either succeed silently or return clear error
+        response2 = requests.post(
+            f"{server_url}/api/scribe/shutdown",
+            json={"session_id": session_id},
+            headers=headers,
+        )
+        # Should either return OK (idempotent) or a proper error status
+        # What we DON'T want is a crash (502/503) or timeout
+        assert response2.status_code in [200, 400, 404, 500], (
+            f"Second shutdown should handle gracefully, got {response2.status_code}: {response2.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_shutdown_nonexistent_session_returns_error(
+        self,
+        reset_mcp_module,
+        cleanup_jupyter_processes,
+    ):
+        """Verify shutting down a non-existent session gives clear error."""
+        test_session_id = str(uuid.uuid4())
+        mcp_server = reset_mcp_module(test_session_id)
+
+        server_url = mcp_server.ensure_server_running()
+        token = mcp_server.get_token()
+        headers = {"Authorization": f"token {token}"} if token else {}
+
+        fake_session_id = "nonexistent-session-00000000-0000-0000-0000-000000000000"
+
+        response = requests.post(
+            f"{server_url}/api/scribe/shutdown",
+            json={"session_id": fake_session_id},
+            headers=headers,
+        )
+
+        # Should return error, not crash
+        assert response.status_code in [400, 404, 500], (
+            f"Shutdown of non-existent session should error, got {response.status_code}"
+        )
+
+        if response.status_code == 500:
+            error_data = response.json()
+            error_text = error_data.get("error", "").lower()
+            assert "session" in error_text or "not found" in error_text, (
+                f"Error should mention session not found, got: {error_data}"
+            )
+
+
+class TestNotebookPathEdgeCases:
+    """Integration tests for notebook path edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_notebook_path_with_special_characters_in_name(
+        self,
+        reset_mcp_module,
+        cleanup_jupyter_processes,
+    ):
+        """Verify experiment names with special characters work."""
+        test_session_id = str(uuid.uuid4())
+        mcp_server = reset_mcp_module(test_session_id)
+
+        server_url = mcp_server.ensure_server_running()
+        token = mcp_server.get_token()
+        headers = {"Authorization": f"token {token}"} if token else {}
+
+        # Test with special characters that should be URL-safe
+        special_name = "test_experiment-v2.1_final"
+
+        response = requests.post(
+            f"{server_url}/api/scribe/start",
+            json={"experiment_name": special_name},
+            headers=headers,
+        )
+
+        assert response.ok, f"Session with special chars should start: {response.text}"
+        session_data = response.json()
+        assert "session_id" in session_data
+        assert "notebook_path" in session_data
+        assert special_name in session_data["notebook_path"], (
+            f"Notebook path should contain experiment name, got: {session_data['notebook_path']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_notebook_with_unicode_experiment_name(
+        self,
+        reset_mcp_module,
+        cleanup_jupyter_processes,
+    ):
+        """Verify experiment names with unicode characters are handled."""
+        test_session_id = str(uuid.uuid4())
+        mcp_server = reset_mcp_module(test_session_id)
+
+        server_url = mcp_server.ensure_server_running()
+        token = mcp_server.get_token()
+        headers = {"Authorization": f"token {token}"} if token else {}
+
+        # Unicode in experiment name - should either work or fail gracefully
+        unicode_name = "test_análysis"
+
+        response = requests.post(
+            f"{server_url}/api/scribe/start",
+            json={"experiment_name": unicode_name},
+            headers=headers,
+        )
+
+        # Should either succeed or return a clear validation error
+        if response.ok:
+            session_data = response.json()
+            assert "session_id" in session_data
+        else:
+            # If it fails, should be a proper error, not a crash
+            assert response.status_code in [400, 422, 500], (
+                f"Unicode name should either work or give validation error, got {response.status_code}"
+            )
+
+
+class TestConcurrentOperations:
+    """Integration tests for concurrent session operations."""
+
+    @pytest.mark.asyncio
+    async def test_rapid_session_creation(
+        self,
+        reset_mcp_module,
+        cleanup_jupyter_processes,
+    ):
+        """Verify multiple sessions can be created in rapid succession."""
+        test_session_id = str(uuid.uuid4())
+        mcp_server = reset_mcp_module(test_session_id)
+
+        server_url = mcp_server.ensure_server_running()
+        token = mcp_server.get_token()
+        headers = {"Authorization": f"token {token}"} if token else {}
+
+        session_ids = []
+        num_sessions = 3
+
+        # Create multiple sessions rapidly
+        for i in range(num_sessions):
+            response = requests.post(
+                f"{server_url}/api/scribe/start",
+                json={"experiment_name": f"rapid_test_{i}"},
+                headers=headers,
+            )
+            assert response.ok, f"Session {i} creation should succeed: {response.text}"
+            session_data = response.json()
+            session_ids.append(session_data["session_id"])
+
+        # All session IDs should be unique
+        assert len(set(session_ids)) == num_sessions, (
+            f"All session IDs should be unique, got: {session_ids}"
+        )
+
+        # Verify each session can execute code
+        for i, session_id in enumerate(session_ids):
+            response = requests.post(
+                f"{server_url}/api/scribe/exec",
+                json={"session_id": session_id, "code": f"marker_{i} = {i}"},
+                headers=headers,
+            )
+            assert response.ok, f"Session {i} code execution should succeed: {response.text}"
+
+        # Verify session isolation - each session has its own variable
+        for i, session_id in enumerate(session_ids):
+            response = requests.post(
+                f"{server_url}/api/scribe/exec",
+                json={"session_id": session_id, "code": f"print(marker_{i})"},
+                headers=headers,
+            )
+            assert response.ok
+            result = response.json()
+            outputs = result.get("outputs", [])
+            output_text = "".join(
+                o.get("text", "") for o in outputs if o.get("output_type") == "stream"
+            )
+            assert str(i) in output_text, (
+                f"Session {i} should have marker_{i}={i}, got: {output_text}"
+            )
+
+
+class TestExecutionEdgeCases:
+    """Integration tests for code execution edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_execute_empty_code(
+        self,
+        reset_mcp_module,
+        cleanup_jupyter_processes,
+    ):
+        """Verify executing empty code doesn't crash."""
+        test_session_id = str(uuid.uuid4())
+        mcp_server = reset_mcp_module(test_session_id)
+
+        session_data, server_url, headers = start_session_via_http(mcp_server, "empty_code_test")
+        session_id = session_data["session_id"]
+
+        response = requests.post(
+            f"{server_url}/api/scribe/exec",
+            json={"session_id": session_id, "code": ""},
+            headers=headers,
+        )
+
+        # Should handle gracefully - either succeed with no output or return error
+        assert response.status_code in [200, 400], (
+            f"Empty code should be handled gracefully, got {response.status_code}: {response.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_code_with_syntax_error(
+        self,
+        reset_mcp_module,
+        cleanup_jupyter_processes,
+    ):
+        """Verify syntax errors are returned properly, not causing server crash."""
+        test_session_id = str(uuid.uuid4())
+        mcp_server = reset_mcp_module(test_session_id)
+
+        session_data, server_url, headers = start_session_via_http(mcp_server, "syntax_error_test")
+        session_id = session_data["session_id"]
+
+        response = requests.post(
+            f"{server_url}/api/scribe/exec",
+            json={"session_id": session_id, "code": "def broken syntax here("},
+            headers=headers,
+        )
+
+        assert response.ok, f"Syntax error should not crash server: {response.text}"
+        result = response.json()
+
+        # Should have error in outputs
+        outputs = result.get("outputs", [])
+        has_error = any(o.get("output_type") == "error" for o in outputs)
+        assert has_error, f"Should return error output for syntax error, got: {outputs}"
+
+    @pytest.mark.asyncio
+    async def test_execute_code_that_raises_exception(
+        self,
+        reset_mcp_module,
+        cleanup_jupyter_processes,
+    ):
+        """Verify runtime exceptions are captured and returned properly."""
+        test_session_id = str(uuid.uuid4())
+        mcp_server = reset_mcp_module(test_session_id)
+
+        session_data, server_url, headers = start_session_via_http(mcp_server, "exception_test")
+        session_id = session_data["session_id"]
+
+        response = requests.post(
+            f"{server_url}/api/scribe/exec",
+            json={"session_id": session_id, "code": "raise ValueError('test error message')"},
+            headers=headers,
+        )
+
+        assert response.ok, f"Exception should not crash server: {response.text}"
+        result = response.json()
+
+        outputs = result.get("outputs", [])
+        error_outputs = [o for o in outputs if o.get("output_type") == "error"]
+        assert len(error_outputs) > 0, f"Should capture exception as error output, got: {outputs}"
+
+        error = error_outputs[0]
+        assert error.get("ename") == "ValueError", f"Should capture error type, got: {error}"
+        assert "test error message" in error.get("evalue", ""), (
+            f"Should capture error message, got: {error}"
+        )

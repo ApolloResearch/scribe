@@ -192,11 +192,13 @@ def load_state() -> dict | None:
 
 def clear_state() -> None:
     """Remove state file (used when server is confirmed dead)."""
-    state_file = _get_state_file()
     try:
+        state_file = _get_state_file()
         if state_file.exists():
             state_file.unlink()
-    except OSError:
+    except (OSError, RuntimeError):
+        # RuntimeError: SCRIBE_SESSION_ID not set (can happen during atexit cleanup)
+        # OSError: file operation failed
         pass
 
 

@@ -156,14 +156,13 @@ def python_path():
 
 @pytest.fixture
 def cleanup_jupyter_processes():
-    """Fixture to clean up any Jupyter processes started during tests."""
+    """Fixture that signals tests need server cleanup.
+
+    The actual cleanup is done by reset_mcp_module fixture which tracks
+    the specific server process it started. This fixture exists for
+    backwards compatibility and as a marker that the test needs cleanup.
+    """
     yield
-    # Kill any orphaned scribe Jupyter processes from tests
-    subprocess.run(
-        ["pkill", "-f", "scribe.notebook.notebook_server"],
-        capture_output=True,
-        check=False,
-    )
 
 
 @pytest.fixture
@@ -173,8 +172,11 @@ def reset_mcp_module():
     Usage:
         mcp_server = reset_mcp_module(test_session_id)
         # mcp_server is now a fresh module with SCRIBE_SESSION_ID set
+
+    Automatically cleans up any server processes started during the test.
     """
-    created_contexts = []
+    created_contexts: list = []
+    created_modules: list = []  # Track modules to clean up their servers
 
     def _reset(session_id: str):
         ctx = patch.dict(os.environ, {"SCRIBE_SESSION_ID": session_id})
@@ -190,9 +192,22 @@ def reset_mcp_module():
         mcp_server._server_token = None  # pyright: ignore[reportAttributeAccessIssue]
         mcp_server._is_external_server = False  # pyright: ignore[reportAttributeAccessIssue]
         mcp_server._active_sessions = {}  # pyright: ignore[reportAttributeAccessIssue]
+
+        created_modules.append(mcp_server)
         return mcp_server
 
     yield _reset
+
+    # Cleanup: terminate any server processes we started
+    for mcp_server in created_modules:
+        process = getattr(mcp_server, "_server_process", None)
+        if process is not None and process.poll() is None:  # Still running
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
     # Cleanup: stop all patch contexts
     for ctx in created_contexts:

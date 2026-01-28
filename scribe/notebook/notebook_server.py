@@ -1,22 +1,20 @@
-"""
-Runs a Jupyter Server for the Scribe MCP server to connect to.
+"""Runs a Jupyter Server for the Scribe MCP server to connect to.
 """
 
-import uuid
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, Optional
-import sys
 import os
+import sys
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import nbformat
 from jupyter_server.serverapp import ServerApp
-from traitlets import Unicode, Int
+from traitlets import Int, Unicode
+
 from scribe.notebook._notebook_server_utils import clean_notebook_for_save
-from dataclasses import dataclass
 
 from . import notebook_sever_handlers as _handlers
-
 
 
 # Request/Response models as simple dicts for Tornado handlers
@@ -30,7 +28,7 @@ class ScribeNotebookSession:
     notebook_path: Path
     display_name: str
     execution_count: int = 0
-    last_activity: Optional[datetime] = None
+    last_activity: datetime | None = None
 
 
 class ScribeServerApp(ServerApp):
@@ -51,7 +49,7 @@ class ScribeServerApp(ServerApp):
 
         # Single source of truth for all session data
         # Maps session ID to session instance
-        self.sessions: Dict[str, ScribeNotebookSession] = {}
+        self.sessions: dict[str, ScribeNotebookSession] = {}
 
         # Track last activity time
         self.last_activity_time = datetime.now()
@@ -75,7 +73,6 @@ class ScribeServerApp(ServerApp):
 
         # Now set up notebooks directory with the parsed configuration
         self.notebooks_path = self._setup_notebooks_directory()
-
 
     def _setup_notebooks_directory(self) -> Path:
         """Set up and validate the notebooks directory with enhanced path handling."""
@@ -150,8 +147,7 @@ class ScribeServerApp(ServerApp):
     async def start_session(
         self, experiment_name=None, existing_notebook_path=None, fork_prev_notebook=True
     ):
-        """
-        Start a new scribe jupyter session -- one-to-one with a notebook and a kernel.
+        """Start a new scribe jupyter session -- one-to-one with a notebook and a kernel.
 
         Args:
             experiment_name: Name for the experiment/notebook
@@ -254,6 +250,15 @@ class ScribeServerApp(ServerApp):
         # Create a kernel first to ensure it uses our current environment
         kernel_id = await self.kernel_manager.start_kernel()
 
+        # Wait for kernel to be ready before proceeding
+        kernel = self.kernel_manager.get_kernel(kernel_id)
+        client = kernel.client()
+        client.start_channels()
+        try:
+            client.wait_for_ready(timeout=60)  # Wait up to 60 seconds for kernel to be ready
+        finally:
+            client.stop_channels()
+
         # Now create a session and associate it with our kernel
         sm = self.web_app.settings["session_manager"]
         session = await sm.create_session(
@@ -279,7 +284,7 @@ class ScribeServerApp(ServerApp):
         restoration_results = []
         if existing_notebook_path:
             # Read the notebook
-            with open(nb_path, "r") as f:
+            with open(nb_path) as f:
                 nb = nbformat.read(f, as_version=nbformat.NO_CONVERT)
 
             if nb.cells:
@@ -406,7 +411,7 @@ class ScribeServerApp(ServerApp):
             raise ValueError(f"Session {session_id} not found")
 
         # Read notebook
-        with open(session.notebook_path, "r") as f:
+        with open(session.notebook_path) as f:
             nb = nbformat.read(f, as_version=nbformat.NO_CONVERT)
 
         # Add markdown cell
@@ -420,8 +425,7 @@ class ScribeServerApp(ServerApp):
         return len(nb.cells)
 
     async def _add_pending_cell(self, session_id: str, code: str) -> int:
-        """
-        Add a code cell with pending execution status.
+        """Add a code cell with pending execution status.
         Used to immediately add a code cell to the notebook file before execution
         begins, giving users visual feedback that something is happening.
         """
@@ -430,7 +434,7 @@ class ScribeServerApp(ServerApp):
             raise ValueError(f"Session {session_id} not found")
 
         # Read notebook
-        with open(session.notebook_path, "r") as f:
+        with open(session.notebook_path) as f:
             nb = nbformat.read(f, as_version=nbformat.NO_CONVERT)
 
         # Get next execution count
@@ -464,7 +468,7 @@ class ScribeServerApp(ServerApp):
             return
 
         # Read notebook
-        with open(session.notebook_path, "r") as f:
+        with open(session.notebook_path) as f:
             nb = nbformat.read(f, as_version=nbformat.NO_CONVERT)
 
         if cell_index >= len(nb.cells):
@@ -650,7 +654,7 @@ class ScribeServerApp(ServerApp):
             return
 
         # Read notebook
-        with open(session.notebook_path, "r") as f:
+        with open(session.notebook_path) as f:
             nb = nbformat.read(f, as_version=nbformat.NO_CONVERT)
 
         if cell_index < len(nb.cells):
@@ -673,7 +677,7 @@ class ScribeServerApp(ServerApp):
             raise ValueError(f"Session {session_id} not found")
 
         # Read notebook
-        with open(session.notebook_path, "r") as f:
+        with open(session.notebook_path) as f:
             nb = nbformat.read(f, as_version=nbformat.NO_CONVERT)
 
         # Find code cells only
@@ -752,7 +756,6 @@ class ScribeServerApp(ServerApp):
         # Delete the Jupyter session (this also shuts down the kernel)
         sm = self.web_app.settings["session_manager"]
         await sm.delete_session(session.jupyter_session_id)
-
 
         # Clean up our session tracking
         del self.sessions[session_id]
