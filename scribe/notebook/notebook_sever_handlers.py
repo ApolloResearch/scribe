@@ -1,5 +1,4 @@
-"""
-Tornado HTTP handlers for the Scribe Jupyter Server API.
+"""Tornado HTTP handlers for the Scribe Jupyter Server API.
 
 This module contains all the HTTP request handlers that implement the Scribe API endpoints.
 These handlers receive HTTP requests, call the appropriate methods on the ScribeServerApp,
@@ -12,10 +11,14 @@ Each handler:
 4. Handles errors gracefully with appropriate HTTP status codes
 """
 
-import uuid
 import json
+import uuid
+
+import structlog
 from jupyter_server.base.handlers import APIHandler
 from tornado.web import authenticated
+
+logger = structlog.get_logger(__name__)
 
 
 # Tornado handlers for Scribe API
@@ -34,6 +37,7 @@ class StartSessionHandler(ScribeAPIHandler):
     @authenticated
     async def post(self):
         request_id = str(uuid.uuid4())[:8]
+        data = None
         try:
             data = self.get_json_body() or {}
 
@@ -58,8 +62,20 @@ class StartSessionHandler(ScribeAPIHandler):
 
             self.finish(json.dumps(result))
         except Exception as e:
+            logger.exception(
+                "start_session_failed",
+                request_id=request_id,
+                request_data=data,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+
             self.set_status(500)
-            self.finish(json.dumps({"error": str(e), "request_id": request_id}))
+            self.finish(json.dumps({
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "request_id": request_id
+            }))
 
 
 class ExecuteCodeHandler(ScribeAPIHandler):
@@ -83,12 +99,23 @@ class ExecuteCodeHandler(ScribeAPIHandler):
             # Add session_id to response
             result["session_id"] = data["session_id"]
 
-
             self.finish(json.dumps(result))
         except Exception as e:
+            logger.exception(
+                "execute_code_failed",
+                request_id=request_id,
+                session_id=session_id,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
 
             self.set_status(500)
-            self.finish(json.dumps({"error": str(e), "request_id": request_id}))
+            self.finish(json.dumps({
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "request_id": request_id,
+                "session_id": session_id
+            }))
 
 
 class ShutdownSessionHandler(ScribeAPIHandler):
@@ -131,7 +158,6 @@ class AddMarkdownHandler(ScribeAPIHandler):
                 data["session_id"], data["content"]
             )
 
-
             self.finish(
                 json.dumps(
                     {"session_id": data["session_id"], "cell_number": cell_number}
@@ -166,7 +192,6 @@ class EditCellHandler(ScribeAPIHandler):
 
             # Add session_id to response
             result["session_id"] = session_id
-
 
             self.finish(json.dumps(result))
 

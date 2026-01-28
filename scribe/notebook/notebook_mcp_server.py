@@ -32,9 +32,12 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import structlog
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from pydantic import BaseModel
+
+logger = structlog.get_logger(__name__)
 
 from scribe.notebook._notebook_server_utils import (
     check_server_health,
@@ -135,7 +138,7 @@ def _get_state_file() -> Path:
     cwd_hash = hashlib.md5(os.getcwd().encode()).hexdigest()[:8]
     # Include first 8 chars of session_id for uniqueness
     state_file = Path.home() / f".scribe_state_{cwd_hash}_{session_id[:8]}.json"
-    print(f"[scribe] Using state file: {state_file}", file=sys.stderr)
+    logger.info("using_state_file", state_file=str(state_file))
     return state_file
 
 
@@ -168,7 +171,7 @@ def save_state() -> None:
         # Atomic rename
         os.replace(temp_file, state_file)
     except OSError as e:
-        print(f"[scribe] Warning: Failed to save state: {e}", file=sys.stderr)
+        logger.warning("failed_to_save_state", error=str(e))
         # Clean up temp file if it exists
         try:
             temp_file.unlink()
@@ -360,7 +363,7 @@ def ensure_server_running() -> str:
     signal.signal(signal.SIGTERM, lambda _sig, _frame: cleanup_server())
     signal.signal(signal.SIGINT, lambda _sig, _frame: cleanup_server())
 
-    print(f"[scribe] Started managed Jupyter server at {_server_url}", file=sys.stderr)
+    logger.info("started_managed_jupyter_server", url=_server_url)
 
     # Persist state for recovery after compaction
     save_state()
@@ -440,7 +443,7 @@ async def _start_session_internal(
         # Start session
         token = get_token()
         headers = {"Authorization": f"token {token}"} if token else {}
-        print(f"[DEBUG MCP] {tool_name}: Connecting to {server_url}", file=sys.stderr)
+        logger.debug("mcp_connecting", tool=tool_name, server_url=server_url)
 
         response = requests.post(
             f"{server_url}/api/scribe/start", json=request_body, headers=headers
