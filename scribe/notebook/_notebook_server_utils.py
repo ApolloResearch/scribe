@@ -14,14 +14,14 @@ logger = structlog.get_logger(__name__)
 from ._image_processing_utils import resize_image_if_needed
 
 
-def find_safe_port(start_port=20000, max_port=30000):
+def find_safe_port(start_port=35000, max_port=45000):
     """Find a port that's not in use by anyone.
 
     Uses random selection to minimize conflicts between users.
 
     Args:
-        start_port: Minimum port number (default: 20000)
-        max_port: Maximum port number (default: 30000)
+        start_port: Minimum port number (default: 35000)
+        max_port: Maximum port number (default: 45000)
 
     Returns:
         int: Available port number, or None if none found

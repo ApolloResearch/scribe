@@ -308,3 +308,199 @@ class TestCheckResponse:
         error_msg = str(exc_info.value)
         assert "No error details" in error_msg
         assert "HTTP 500" in error_msg
+
+
+class TestStateFileMigration:
+    """Tests for state file version migration (v1 → v2)."""
+
+    def test_load_state_corrupted_json_returns_none(self):
+        """Verify corrupted JSON state file returns None, doesn't crash."""
+        from scribe.notebook.notebook_mcp_server import load_state
+
+        session_id = "test_session_corrupted"
+
+        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": session_id}):
+            with patch("scribe.notebook.notebook_mcp_server._get_state_file") as mock_get_file:
+                mock_path = MagicMock()
+                mock_path.exists.return_value = True
+                mock_path.read_text.return_value = "{ invalid json }"
+                mock_get_file.return_value = mock_path
+
+                result = load_state()
+                assert result is None, "Corrupted JSON should return None"
+
+    def test_load_state_valid_json_returns_dict(self):
+        """Verify valid JSON state file returns parsed dict."""
+        from scribe.notebook.notebook_mcp_server import load_state
+
+        session_id = "test_session_valid"
+        state_data = {"version": 2, "server": {"port": 8888}}
+
+        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": session_id}):
+            with patch("scribe.notebook.notebook_mcp_server._get_state_file") as mock_get_file:
+                import json
+                mock_path = MagicMock()
+                mock_path.exists.return_value = True
+                mock_path.read_text.return_value = json.dumps(state_data)
+                mock_get_file.return_value = mock_path
+
+                result = load_state()
+                assert result == state_data
+
+    def test_load_state_missing_file_returns_none(self):
+        """Verify missing state file returns None."""
+        from scribe.notebook.notebook_mcp_server import load_state
+
+        session_id = "test_session_missing"
+
+        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": session_id}):
+            with patch("scribe.notebook.notebook_mcp_server._get_state_file") as mock_get_file:
+                mock_path = MagicMock()
+                mock_path.exists.return_value = False
+                mock_get_file.return_value = mock_path
+
+                result = load_state()
+                assert result is None
+
+
+class TestPortFinding:
+    """Tests for find_safe_port() function."""
+
+    def test_find_safe_port_returns_bindable_port(self):
+        """Verify find_safe_port returns a port we can actually bind to."""
+        from scribe.notebook._notebook_server_utils import find_safe_port
+        import socket
+
+        port = find_safe_port()
+        assert port is not None, "find_safe_port should return a port"
+        assert 35000 <= port <= 45000, "Port should be in expected range"
+
+        # Verify we can actually bind to it
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", port))  # Should not raise
+
+    def test_find_safe_port_custom_range(self):
+        """Verify find_safe_port respects custom port range."""
+        from scribe.notebook._notebook_server_utils import find_safe_port
+
+        port = find_safe_port(start_port=40000, max_port=40100)
+        assert port is not None
+        assert 40000 <= port <= 40100
+
+
+class TestExternalServerFailures:
+    """Tests for external server (SCRIBE_PORT/SCRIBE_TOKEN) failure modes."""
+
+    def test_external_server_unreachable_logs_warning(self):
+        """Verify warning when SCRIBE_PORT is set but nothing is listening."""
+        import importlib
+        from io import StringIO
+
+        with patch.dict(
+            os.environ,
+            {"SCRIBE_PORT": "59999", "SCRIBE_TOKEN": "test_token"},
+            clear=False,
+        ):
+            # Mock check_jupyter_status to return UNREACHABLE
+            with patch("scribe.notebook.notebook_mcp_server.check_jupyter_status") as mock_check:
+                from scribe.notebook.notebook_mcp_server import ServerStatus
+                mock_check.return_value = ServerStatus.UNREACHABLE
+
+                import scribe.notebook.notebook_mcp_server as mcp_server
+                importlib.reload(mcp_server)
+
+                # Reset module state
+                mcp_server._server_port = None
+                mcp_server._server_url = None
+                mcp_server._server_token = None
+                mcp_server._is_external_server = False
+
+                # Capture stderr to check for warning
+                with patch("sys.stderr", new_callable=StringIO) as mock_stderr:
+                    url = mcp_server.ensure_server_running()
+
+                    # Should still return URL (external server mode)
+                    assert url == "http://127.0.0.1:59999"
+                    assert mcp_server._is_external_server is True
+
+                    # Should have logged a warning
+                    stderr_output = mock_stderr.getvalue()
+                    assert "Warning" in stderr_output or "unreachable" in stderr_output.lower()
+
+                # Clean up
+                mcp_server._server_port = None
+                mcp_server._server_url = None
+                mcp_server._server_token = None
+                mcp_server._is_external_server = False
+
+    def test_external_server_unauthorized_logs_warning(self):
+        """Verify warning when SCRIBE_TOKEN is invalid (401/403)."""
+        import importlib
+        from io import StringIO
+
+        with patch.dict(
+            os.environ,
+            {"SCRIBE_PORT": "59999", "SCRIBE_TOKEN": "wrong_token"},
+            clear=False,
+        ):
+            with patch("scribe.notebook.notebook_mcp_server.check_jupyter_status") as mock_check:
+                from scribe.notebook.notebook_mcp_server import ServerStatus
+                mock_check.return_value = ServerStatus.UNAUTHORIZED
+
+                import scribe.notebook.notebook_mcp_server as mcp_server
+                importlib.reload(mcp_server)
+
+                mcp_server._server_port = None
+                mcp_server._server_url = None
+                mcp_server._server_token = None
+                mcp_server._is_external_server = False
+
+                with patch("sys.stderr", new_callable=StringIO) as mock_stderr:
+                    url = mcp_server.ensure_server_running()
+
+                    assert url == "http://127.0.0.1:59999"
+                    stderr_output = mock_stderr.getvalue()
+                    assert "Warning" in stderr_output or "unauthorized" in stderr_output.lower()
+
+                mcp_server._server_port = None
+                mcp_server._server_url = None
+                mcp_server._server_token = None
+                mcp_server._is_external_server = False
+
+
+class TestCleanupHandlers:
+    """Tests for cleanup_server() and related cleanup logic."""
+
+    def test_cleanup_scribe_server_handles_none_process(self):
+        """Verify cleanup handles None process gracefully."""
+        from scribe.notebook._notebook_server_utils import cleanup_scribe_server
+
+        # Should not raise (function has `if process:` check at runtime)
+        cleanup_scribe_server(None)  # type: ignore[arg-type]
+
+    def test_cleanup_scribe_server_terminates_running_process(self):
+        """Verify cleanup terminates a running process."""
+        from scribe.notebook._notebook_server_utils import cleanup_scribe_server
+
+        mock_process = MagicMock()
+        mock_process.poll.return_value = None  # Still running
+        mock_process.wait.return_value = 0
+
+        cleanup_scribe_server(mock_process)
+
+        mock_process.terminate.assert_called_once()
+        mock_process.wait.assert_called()
+
+    def test_cleanup_scribe_server_kills_stubborn_process(self):
+        """Verify cleanup kills process that doesn't terminate gracefully."""
+        import subprocess
+        from scribe.notebook._notebook_server_utils import cleanup_scribe_server
+
+        mock_process = MagicMock()
+        mock_process.poll.return_value = None  # Still running
+        mock_process.wait.side_effect = [subprocess.TimeoutExpired("cmd", 5), 0]
+
+        cleanup_scribe_server(mock_process)
+
+        mock_process.terminate.assert_called_once()
+        mock_process.kill.assert_called_once()
