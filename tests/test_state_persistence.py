@@ -14,16 +14,25 @@ import os
 import stat
 import subprocess
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient  # type: ignore[import-not-found]
 
+import scribe.notebook.notebook_mcp_server as mcp_module  # type: ignore[import]
+
+# Aliases for cleaner usage in tests (pyright can't resolve these but they work at runtime)
+SessionInfo = mcp_module.SessionInfo  # pyright: ignore[reportAttributeAccessIssue]
+_get_state_file = mcp_module._get_state_file  # pyright: ignore[reportAttributeAccessIssue]
+save_state = mcp_module.save_state  # pyright: ignore[reportAttributeAccessIssue]
 
 # Path to the isolated venv with modified scribe installed
 SCRIBE_FORK_DIR = Path(__file__).parent.parent
 ISOLATED_PYTHON = SCRIBE_FORK_DIR / ".venv" / "bin" / "python"
+
+# Model to use for integration tests (Haiku for speed/cost)
+TEST_MODEL = "claude-haiku-4-5-20251001"
 
 
 # ============================================================================
@@ -135,6 +144,7 @@ class TestStatePersistence:
     ):
         """Verify state file is created when a notebook session starts."""
         options = ClaudeAgentOptions(
+            model=TEST_MODEL,
             mcp_servers=get_scribe_mcp_config(python_path),
             allowed_tools=[
                 "mcp__scribe__start_new_session",
@@ -174,6 +184,7 @@ class TestStatePersistence:
     ):
         """Verify scribe reconnects to existing Jupyter after MCP process restart."""
         options = ClaudeAgentOptions(
+            model=TEST_MODEL,
             mcp_servers=get_scribe_mcp_config(python_path),
             allowed_tools=[
                 "mcp__scribe__start_new_session",
@@ -223,6 +234,7 @@ class TestStatePersistence:
         initial_new_files, _ = track_state_files()
 
         options = ClaudeAgentOptions(
+            model=TEST_MODEL,
             mcp_servers=get_scribe_mcp_config(python_path),
             allowed_tools=[
                 "mcp__scribe__start_new_session",
@@ -280,6 +292,7 @@ class TestStatePersistence:
     ):
         """Verify state file is created with 0o600 permissions (owner read/write only)."""
         options = ClaudeAgentOptions(
+            model=TEST_MODEL,
             mcp_servers=get_scribe_mcp_config(python_path),
             allowed_tools=[
                 "mcp__scribe__start_new_session",
@@ -353,7 +366,7 @@ class TestServerStatusChecks:
         """Verify healthy server returns HEALTHY status."""
         # Import the function we want to test
         # type: ignore comments needed until implementation exists
-        from scribe.notebook.notebook_mcp_server import check_jupyter_status, ServerStatus  # type: ignore[attr-defined]
+        from scribe.notebook.notebook_mcp_server import ServerStatus, check_jupyter_status  # type: ignore[attr-defined]
 
         with patch("scribe.notebook.notebook_mcp_server.requests.get") as mock_get:
             mock_response = MagicMock()
@@ -365,7 +378,7 @@ class TestServerStatusChecks:
 
     def test_check_jupyter_status_unauthorized(self):
         """Verify 401/403 returns UNAUTHORIZED status (not UNREACHABLE)."""
-        from scribe.notebook.notebook_mcp_server import check_jupyter_status, ServerStatus  # type: ignore[attr-defined]
+        from scribe.notebook.notebook_mcp_server import ServerStatus, check_jupyter_status  # type: ignore[attr-defined]
 
         with patch("scribe.notebook.notebook_mcp_server.requests.get") as mock_get:
             mock_response = MagicMock()
@@ -389,7 +402,7 @@ class TestServerStatusChecks:
 
     def test_check_jupyter_status_unreachable(self):
         """Verify connection errors return UNREACHABLE status."""
-        from scribe.notebook.notebook_mcp_server import check_jupyter_status, ServerStatus  # type: ignore[attr-defined]
+        from scribe.notebook.notebook_mcp_server import ServerStatus, check_jupyter_status  # type: ignore[attr-defined]
 
         with patch("scribe.notebook.notebook_mcp_server.requests.get") as mock_get:
             mock_get.side_effect = requests.ConnectionError("Connection refused")
@@ -399,8 +412,10 @@ class TestServerStatusChecks:
 
     def test_is_jupyter_alive_backwards_compatible(self):
         """Verify is_jupyter_alive returns bool (backwards compatible)."""
-        from scribe.notebook.notebook_mcp_server import is_jupyter_alive  # type: ignore[attr-defined]
-        from scribe.notebook.notebook_mcp_server import ServerStatus  # type: ignore[attr-defined]
+        from scribe.notebook.notebook_mcp_server import (
+            ServerStatus,  # type: ignore[attr-defined]
+            is_jupyter_alive,  # type: ignore[attr-defined]
+        )
 
         with patch("scribe.notebook.notebook_mcp_server.check_jupyter_status") as mock_check:
             mock_check.return_value = ServerStatus.HEALTHY
@@ -433,6 +448,7 @@ class TestExternalServer:
         ):
             # Need to reimport to pick up env changes
             import importlib
+
             import scribe.notebook.notebook_mcp_server as mcp_server
             importlib.reload(mcp_server)
 
@@ -479,13 +495,11 @@ class TestSessionIsolation:
         session_id_1 = "aaaaaaaa-1111-1111-1111-111111111111"
         session_id_2 = "bbbbbbbb-2222-2222-2222-222222222222"
 
-        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": session_id_1}):
-            with patch("os.getcwd", return_value=cwd):
-                file1 = _get_state_file()
+        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": session_id_1}), patch("os.getcwd", return_value=cwd):
+            file1 = _get_state_file()
 
-        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": session_id_2}):
-            with patch("os.getcwd", return_value=cwd):
-                file2 = _get_state_file()
+        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": session_id_2}), patch("os.getcwd", return_value=cwd):
+            file2 = _get_state_file()
 
         assert file1 != file2, "Different session IDs should use different state files"
         assert "aaaaaaaa" in file1.name
@@ -498,10 +512,9 @@ class TestSessionIsolation:
         cwd = "/tmp/test_cwd"
         session_id = "persistent_session_123"
 
-        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": session_id}):
-            with patch("os.getcwd", return_value=cwd):
-                file1 = _get_state_file()
-                file2 = _get_state_file()
+        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": session_id}), patch("os.getcwd", return_value=cwd):
+            file1 = _get_state_file()
+            file2 = _get_state_file()
 
         assert file1 == file2, "Same session ID should use same state file"
 
@@ -698,6 +711,7 @@ class TestErrorHandlingAndSessionDiscovery:
     ):
         """Verify list_sessions tool works through MCP protocol."""
         options = ClaudeAgentOptions(
+            model=TEST_MODEL,
             mcp_servers=get_scribe_mcp_config(python_path),
             allowed_tools=[
                 "mcp__scribe__start_new_session",
@@ -729,3 +743,474 @@ class TestErrorHandlingAndSessionDiscovery:
         # Both should have occurred
         assert session_id_found, "Should have seen a session_id from list_sessions"
         assert executed_successfully, "Should have successfully executed code using listed session_id"
+
+
+# ============================================================================
+# Compaction Scenario Integration Tests (TDD - should fail initially)
+# ============================================================================
+
+
+class TestCompactionScenariosDirect:
+    """Direct tests (without agent) for state persistence across MCP restarts.
+
+    These tests directly call the MCP server functions to verify core functionality
+    without relying on agent interpretation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_state_persistence_direct(
+        self,
+        cleanup_jupyter_processes,
+    ):
+        """Directly verify state persistence works across MCP module reloads."""
+        import importlib
+        import uuid
+
+        import requests
+
+        test_session_id = str(uuid.uuid4())
+
+        # Phase 1: Start server, create session, execute code
+        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": test_session_id}):
+            import scribe.notebook.notebook_mcp_server as mcp_server
+
+            importlib.reload(mcp_server)
+
+            # Reset module state
+            mcp_server._server_process = None
+            mcp_server._server_port = None
+            mcp_server._server_url = None
+            mcp_server._server_token = None
+            mcp_server._is_external_server = False
+            mcp_server._active_sessions = {}
+
+            # Start server and create session
+            server_url = mcp_server.ensure_server_running()
+            token = mcp_server.get_token()
+            headers = {"Authorization": f"token {token}"} if token else {}
+
+            # Create session via HTTP
+            response = requests.post(
+                f"{server_url}/api/scribe/start",
+                json={"experiment_name": "direct_test"},
+                headers=headers,
+            )
+            assert response.ok, f"Failed to start session: {response.text}"
+            session_data = response.json()
+            session_id = session_data["session_id"]
+            notebook_path = session_data["notebook_path"]
+
+            # Register session in MCP server's tracking (normally done by MCP tool)
+            mcp_server._active_sessions[session_id] = mcp_server.SessionInfo(  # type: ignore[attr-defined]
+                session_id=session_id,
+                notebook_path=notebook_path,
+            )
+
+            # Execute code to set variable
+            response = requests.post(
+                f"{server_url}/api/scribe/exec",
+                json={"session_id": session_id, "code": "test_var = 'persistence_works'"},
+                headers=headers,
+            )
+            assert response.ok, f"Failed to execute code: {response.text}"
+
+            # Save state and capture port for later verification
+            mcp_server.save_state()  # type: ignore[attr-defined]
+            original_port = mcp_server._server_port
+
+            # Verify state was saved with session
+            state_file = mcp_server._get_state_file()  # type: ignore[attr-defined]
+            saved_state = json.loads(state_file.read_text())
+            assert len(saved_state.get("sessions", [])) > 0, "State file should have sessions"
+
+        # Phase 2: Simulate MCP restart by reloading module and clearing state
+        with patch.dict(os.environ, {"SCRIBE_SESSION_ID": test_session_id}):
+            importlib.reload(mcp_server)
+
+            # Reset module state (simulating fresh MCP process)
+            mcp_server._server_process = None
+            mcp_server._server_port = None
+            mcp_server._server_url = None
+            mcp_server._server_token = None
+            mcp_server._is_external_server = False
+            mcp_server._active_sessions = {}
+
+            # Reconnect - should restore from state file
+            server_url = mcp_server.ensure_server_running()
+            token = mcp_server.get_token()
+            headers = {"Authorization": f"token {token}"} if token else {}
+
+            # Verify we reconnected to same server
+            assert mcp_server._server_port == original_port, (
+                f"Should reconnect to same port. Expected {original_port}, got {mcp_server._server_port}"
+            )
+
+            # Verify sessions were restored
+            assert len(mcp_server._active_sessions) > 0, "Sessions should be restored from state"
+            assert session_id in mcp_server._active_sessions, f"Session {session_id} should be in active sessions"
+
+            # Execute code to verify kernel state persists
+            response = requests.post(
+                f"{server_url}/api/scribe/exec",
+                json={"session_id": session_id, "code": "print(test_var)"},
+                headers=headers,
+            )
+            assert response.ok, f"Failed to execute code after reconnect: {response.text}"
+            result = response.json()
+
+            # Check output contains our test value
+            outputs = result.get("outputs", [])
+            output_text = "".join(
+                o.get("text", "") for o in outputs if o.get("output_type") == "stream"
+            )
+            assert "persistence_works" in output_text, (
+                f"Variable should persist after MCP restart. Got output: {output_text}"
+            )
+
+
+class TestCompactionScenarios:
+    """Integration tests for scenarios that fail in production during compaction.
+
+    These tests verify that the actual workflows work after an MCP restart
+    (simulating Claude Code compaction). They should fail initially, revealing
+    the gaps in the current implementation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_kernel_state_persists_across_compaction(
+        self,
+        python_path: str,
+        track_state_files,
+        cleanup_jupyter_processes,
+    ):
+        """Verify variables survive MCP restart (compaction simulation).
+
+        This is the core compaction failure scenario:
+        1. MCP 1: Create session, set x = 42
+        2. MCP 1 exits (simulating compaction)
+        3. MCP 2: Get session_id from state, execute print(x)
+        4. Assert: Output contains "42"
+        """
+        import uuid
+
+        # Use a fixed session ID so both MCP instances use the same state file
+        shared_session_id = str(uuid.uuid4())
+
+        options = ClaudeAgentOptions(
+            model=TEST_MODEL,
+            mcp_servers=get_scribe_mcp_config(python_path, session_id=shared_session_id),
+            allowed_tools=[
+                "mcp__scribe__start_new_session",
+                "mcp__scribe__execute_code",
+            ],
+            max_turns=5,
+        )
+
+        # MCP 1: Create session and set variable
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(
+                "Use start_new_session to create a notebook, "
+                "then execute_code to run: x = 42"
+            )
+            async for _ in client.receive_response():
+                pass
+
+        # Verify state file exists
+        new_files, _ = track_state_files()
+        assert len(new_files) > 0, "State file should exist after first session"
+        state_file = next(iter(new_files))
+        state = json.loads(state_file.read_text())
+        saved_sessions = state.get("sessions", [])
+        assert len(saved_sessions) > 0, "Should have at least one session saved"
+
+        # MCP 2: Use the same session_id to execute print(x)
+        # This simulates what happens after compaction - we need the session_id
+        # from the state file to continue execution
+        variable_value_found = False
+
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(
+                "Use execute_code to run: print(x)  # Should print 42 if state persisted"
+            )
+            async for msg in client.receive_response():
+                msg_text = str(msg)
+                if "42" in msg_text:
+                    variable_value_found = True
+
+        assert variable_value_found, (
+            "Variable x should have value 42 after MCP restart. "
+            "This indicates kernel state was NOT preserved across compaction."
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_then_execute_after_compaction(
+        self,
+        python_path: str,
+        track_state_files,
+        cleanup_jupyter_processes,
+    ):
+        """Verify the actual post-compaction workflow works.
+
+        This tests the expected user workflow:
+        1. MCP 1: Create session, execute x = 42
+        2. MCP 1 exits
+        3. MCP 2: list_sessions -> get session_id -> execute_code(print(x))
+        4. Verify output is "42"
+        """
+        import uuid
+
+        shared_session_id = str(uuid.uuid4())
+
+        options = ClaudeAgentOptions(
+            model=TEST_MODEL,
+            mcp_servers=get_scribe_mcp_config(python_path, session_id=shared_session_id),
+            allowed_tools=[
+                "mcp__scribe__start_new_session",
+                "mcp__scribe__execute_code",
+                "mcp__scribe__list_sessions",
+            ],
+            max_turns=10,
+        )
+
+        # MCP 1: Create session and set variable
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(
+                "Use start_new_session to create a notebook, "
+                "then execute_code to run: my_var = 'compaction_test_value'"
+            )
+            async for _ in client.receive_response():
+                pass
+
+        # MCP 2: Use list_sessions to discover session, then execute
+        test_value_found = False
+        session_discovered = False
+
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(
+                "1. Use list_sessions to find active sessions\n"
+                "2. Use the session_id from list_sessions to execute: print(my_var)\n"
+                "Tell me the exact output."
+            )
+            async for msg in client.receive_response():
+                msg_text = str(msg)
+                # Look for session discovery
+                if "-" in msg_text and len(msg_text) > 30:  # UUID pattern
+                    session_discovered = True
+                # Look for our test value
+                if "compaction_test_value" in msg_text:
+                    test_value_found = True
+
+        assert session_discovered, "Should have discovered session via list_sessions"
+        assert test_value_found, (
+            "Variable my_var should have value 'compaction_test_value' after "
+            "discovering session via list_sessions. This indicates the "
+            "list_sessions -> execute_code workflow fails after compaction."
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_code_with_stale_session_returns_clear_error(
+        self,
+        python_path: str,
+        cleanup_jupyter_processes,
+    ):
+        """Verify stale session_id gives actionable error, not cryptic failure.
+
+        When a session_id exists in state but the kernel has been cleaned up,
+        execute_code should return a clear "Session not found" error, not crash
+        or return confusing output.
+        """
+        import uuid
+
+        shared_session_id = str(uuid.uuid4())
+
+        options = ClaudeAgentOptions(
+            model=TEST_MODEL,
+            mcp_servers=get_scribe_mcp_config(python_path, session_id=shared_session_id),
+            allowed_tools=[
+                "mcp__scribe__start_new_session",
+                "mcp__scribe__execute_code",
+                "mcp__scribe__shutdown_session",
+            ],
+            max_turns=10,
+        )
+
+        captured_session_id = None
+
+        # MCP 1: Create session, capture session_id, then shutdown
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(
+                "1. Use start_new_session to create a notebook\n"
+                "2. Tell me the exact session_id\n"
+                "3. Use shutdown_session to close it"
+            )
+            async for msg in client.receive_response():
+                msg_text = str(msg)
+                # Try to capture UUID-like session ID
+                import re
+                uuid_match = re.search(
+                    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                    msg_text,
+                    re.IGNORECASE,
+                )
+                if uuid_match:
+                    captured_session_id = uuid_match.group()
+
+        assert captured_session_id, "Should have captured a session_id"
+
+        # MCP 2: Try to execute with the now-stale session_id
+        error_received = False
+        error_message = ""
+
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(
+                f"Use execute_code with session_id='{captured_session_id}' to run: print('test')\n"
+                "Tell me the exact error if there is one."
+            )
+            async for msg in client.receive_response():
+                msg_text = str(msg).lower()
+                if "session" in msg_text and ("not found" in msg_text or "error" in msg_text):
+                    error_received = True
+                    error_message = str(msg)
+
+        assert error_received, (
+            f"Should receive clear 'Session not found' error for stale session_id. "
+            f"Instead got: {error_message or 'no clear error message'}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_state_file_includes_notebook_paths(
+        self,
+        python_path: str,
+        track_state_files,
+        cleanup_jupyter_processes,
+    ):
+        """Verify state file preserves notebook paths for post-compaction recovery.
+
+        After compaction, the agent needs to know not just the session_id but also
+        where the notebook file is located. This tests that the state file includes
+        notebook path information.
+        """
+        import uuid
+
+        shared_session_id = str(uuid.uuid4())
+
+        options = ClaudeAgentOptions(
+            model=TEST_MODEL,
+            mcp_servers=get_scribe_mcp_config(python_path, session_id=shared_session_id),
+            allowed_tools=[
+                "mcp__scribe__start_new_session",
+                "mcp__scribe__execute_code",
+            ],
+            max_turns=5,
+        )
+
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(
+                "Use start_new_session with experiment_name='test_notebook_path' "
+                "to create a notebook"
+            )
+            async for _ in client.receive_response():
+                pass
+
+        # Check state file structure
+        new_files, _ = track_state_files()
+        assert len(new_files) > 0, "State file should exist"
+        state_file = next(iter(new_files))
+        state = json.loads(state_file.read_text())
+
+        # Verify sessions include notebook paths
+        sessions = state.get("sessions", [])
+        assert len(sessions) > 0, "Should have at least one session"
+
+        # Check if sessions is a list of dicts with notebook_path, or just a list of IDs
+        if isinstance(sessions[0], str):
+            # Current implementation: sessions is just a list of session IDs
+            pytest.fail(
+                "State file 'sessions' field only contains session IDs, not notebook paths. "
+                "After compaction, agent cannot determine where the notebook file is. "
+                "Sessions should be stored as: [{'session_id': '...', 'notebook_path': '...'}]"
+            )
+        elif isinstance(sessions[0], dict):
+            # Expected implementation: sessions is a list of dicts
+            first_session = sessions[0]
+            assert "notebook_path" in first_session, (
+                "Session entry should include 'notebook_path' for post-compaction recovery"
+            )
+            assert first_session["notebook_path"], "notebook_path should not be empty"
+
+    @pytest.mark.asyncio
+    async def test_multiple_sessions_across_compaction(
+        self,
+        python_path: str,
+        track_state_files,
+        cleanup_jupyter_processes,
+    ):
+        """Verify multiple sessions are all preserved across compaction.
+
+        Production often has 2+ concurrent sessions. This test verifies that
+        all sessions are preserved, not just the most recent one.
+        """
+        import uuid
+
+        shared_session_id = str(uuid.uuid4())
+
+        options = ClaudeAgentOptions(
+            model=TEST_MODEL,
+            mcp_servers=get_scribe_mcp_config(python_path, session_id=shared_session_id),
+            allowed_tools=[
+                "mcp__scribe__start_new_session",
+                "mcp__scribe__execute_code",
+                "mcp__scribe__list_sessions",
+            ],
+            max_turns=15,
+        )
+
+        # MCP 1: Create two sessions with different variables
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(
+                "1. Use start_new_session to create notebook A\n"
+                "2. In that session, execute: session_a_var = 'value_A'\n"
+                "3. Use start_new_session again to create notebook B\n"
+                "4. In the NEW session, execute: session_b_var = 'value_B'\n"
+                "Tell me both session_ids."
+            )
+            async for _ in client.receive_response():
+                pass
+
+        # Check state file has both sessions
+        new_files, _ = track_state_files()
+        assert len(new_files) > 0, "State file should exist"
+        state_file = next(iter(new_files))
+        state = json.loads(state_file.read_text())
+        saved_sessions = state.get("sessions", [])
+
+        assert len(saved_sessions) >= 2, (
+            f"Should have at least 2 sessions saved, got {len(saved_sessions)}. "
+            "Multiple sessions are not being preserved in state file."
+        )
+
+        # MCP 2: Verify both sessions are accessible
+        session_a_found = False
+        session_b_found = False
+
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(
+                "1. Use list_sessions to find all active sessions\n"
+                "2. For EACH session_id, use execute_code to run: "
+                "print(locals().get('session_a_var', 'NOT_FOUND'), "
+                "locals().get('session_b_var', 'NOT_FOUND'))\n"
+                "Tell me the output from each session."
+            )
+            async for msg in client.receive_response():
+                msg_text = str(msg)
+                if "value_A" in msg_text:
+                    session_a_found = True
+                if "value_B" in msg_text:
+                    session_b_found = True
+
+        assert session_a_found, (
+            "Session A with session_a_var='value_A' not accessible after compaction"
+        )
+        assert session_b_found, (
+            "Session B with session_b_var='value_B' not accessible after compaction"
+        )

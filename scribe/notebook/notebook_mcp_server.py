@@ -1,8 +1,22 @@
-"""
-Scribe Notebook MCP Server - Model Context Protocol interface for agents to work with
+"""Scribe Notebook MCP Server - Model Context Protocol interface for agents to work with
 the Scribe notebook server. MCP endpoints are easier for agents to interact with than
 raw HTTP requests or Jupyter Server API calls.
 """
+
+__all__ = [
+    # Public API
+    "SessionInfo",
+    "ServerStatus",
+    "ensure_server_running",
+    "get_token",
+    "save_state",
+    "load_state",
+    "clear_state",
+    "check_jupyter_status",
+    "is_jupyter_alive",
+    # For testing
+    "_get_state_file",
+]
 
 import atexit
 import hashlib
@@ -15,23 +29,30 @@ import sys
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Union
+from typing import Any
 
 import requests
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
+from pydantic import BaseModel
 
 from scribe.notebook._notebook_server_utils import (
-    find_safe_port,
     check_server_health,
-    start_scribe_server,
     cleanup_scribe_server,
+    find_safe_port,
     process_jupyter_outputs,
+    start_scribe_server,
 )  # noqa: E402
-
 
 # Initialize MCP server
 mcp = FastMCP("scribe")
+
+
+class SessionInfo(BaseModel):
+    """Metadata for an active notebook session, persisted across compaction."""
+
+    session_id: str
+    notebook_path: str
 
 
 def _check_response(response: requests.Response, operation: str) -> dict:
@@ -72,18 +93,19 @@ def _check_response(response: requests.Response, operation: str) -> dict:
         # If response isn't JSON, return empty dict rather than crashing
         return {}
 
+
 # Global server management
-_server_process: Optional[subprocess.Popen] = None
-_server_port: Optional[int] = None
-_server_url: Optional[str] = None
-_server_token: Optional[str] = None
+_server_process: subprocess.Popen | None = None
+_server_port: int | None = None
+_server_url: str | None = None
+_server_token: str | None = None
 # Down the line, we may wish to keep the Jupyter server around even after MCP server exits
 _is_external_server: bool = False
 
 SCRIBE_PROVIDER: str | None = os.environ.get("SCRIBE_PROVIDER")
 
-# Session tracking for cleanup
-_active_sessions: set = set()
+# Session tracking for cleanup - maps session_id to SessionInfo
+_active_sessions: dict[str, SessionInfo] = {}
 
 
 # ============================================================================
@@ -126,14 +148,14 @@ def save_state() -> None:
     global _server_port, _server_token, _server_url, _server_process, _active_sessions
 
     state = {
-        "version": 1,
+        "version": 2,  # Bumped version for new session format with notebook paths
         "server": {
             "port": _server_port,
             "token": _server_token,
             "pid": _server_process.pid if _server_process else None,
             "url": _server_url,
         },
-        "sessions": list(_active_sessions),
+        "sessions": [s.model_dump() for s in _active_sessions.values()],
         "updated_at": datetime.now().isoformat(),
     }
     state_file = _get_state_file()
@@ -145,7 +167,7 @@ def save_state() -> None:
         os.chmod(temp_file, 0o600)
         # Atomic rename
         os.replace(temp_file, state_file)
-    except IOError as e:
+    except OSError as e:
         print(f"[scribe] Warning: Failed to save state: {e}", file=sys.stderr)
         # Clean up temp file if it exists
         try:
@@ -160,7 +182,7 @@ def load_state() -> dict | None:
     if state_file.exists():
         try:
             return json.loads(state_file.read_text())
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             return None
     return None
 
@@ -171,7 +193,7 @@ def clear_state() -> None:
     try:
         if state_file.exists():
             state_file.unlink()
-    except IOError:
+    except OSError:
         pass
 
 
@@ -300,7 +322,16 @@ def ensure_server_running() -> str:
                 _server_port = saved_port
                 _server_token = saved_token
                 _server_url = f"http://127.0.0.1:{saved_port}"
-                _active_sessions = set(state.get("sessions", []))
+                # Restore sessions - handle both old format (list of IDs) and new format (list of dicts)
+                saved_sessions = state.get("sessions", [])
+                _active_sessions = {}
+                for s in saved_sessions:
+                    if isinstance(s, dict):
+                        info = SessionInfo(**s)
+                        _active_sessions[info.session_id] = info
+                    elif isinstance(s, str):
+                        # Legacy format: just session ID, no notebook path
+                        _active_sessions[s] = SessionInfo(session_id=s, notebook_path="")
                 _is_external_server = False  # We started it, but don't have process handle
                 # Note: _server_process stays None since we don't own the process handle anymore
                 return _server_url
@@ -345,7 +376,7 @@ def get_token() -> str:
     return _server_token or ""
 
 
-def get_server_status() -> Dict[str, Any]:
+def get_server_status() -> dict[str, Any]:
     """Get current server status information."""
     global _server_port, _server_url, _is_external_server, _server_process
 
@@ -381,13 +412,12 @@ def get_server_status() -> Dict[str, Any]:
 
 
 async def _start_session_internal(
-    experiment_name: Optional[str] = None,
-    notebook_path: Optional[str] = None,
+    experiment_name: str | None = None,
+    notebook_path: str | None = None,
     fork_prev_notebook: bool = True,
     tool_name: str = "start_session",
-) -> Dict[str, Any]:
-    """
-    Internal helper function for starting sessions from scratch versus resuming versus forking existing notebook.
+) -> dict[str, Any]:
+    """Internal helper function for starting sessions from scratch versus resuming versus forking existing notebook.
 
     Args:
         experiment_name: Custom name for the notebook
@@ -430,7 +460,10 @@ async def _start_session_internal(
 
         # Track session for cleanup
         global _active_sessions
-        _active_sessions.add(data["session_id"])
+        _active_sessions[data["session_id"]] = SessionInfo(
+            session_id=data["session_id"],
+            notebook_path=data["notebook_path"],
+        )
 
         # Persist state for recovery after compaction
         save_state()
@@ -502,9 +535,8 @@ async def _start_session_internal(
 
 
 @mcp.tool
-async def start_new_session(experiment_name: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Start a completely new Jupyter kernel session with an empty notebook.
+async def start_new_session(experiment_name: str | None = None) -> dict[str, Any]:
+    """Start a completely new Jupyter kernel session with an empty notebook.
 
     Args:
         experiment_name: Custom name for the notebook (e.g., "ImageGeneration")
@@ -534,9 +566,8 @@ async def start_new_session(experiment_name: Optional[str] = None) -> Dict[str, 
         "title": "Start Session - Resume Notebook"  # A human-readable title for the tool.
     },
 )
-async def start_session_resume_notebook(notebook_path: str) -> Dict[str, Any]:
-    """
-    Start a new session by resuming an existing notebook in-place, modifying the original notebook file.
+async def start_session_resume_notebook(notebook_path: str) -> dict[str, Any]:
+    """Start a new session by resuming an existing notebook in-place, modifying the original notebook file.
 
     This executes all cells in the existing notebook to restore the kernel state and updates
     the notebook file with new outputs. Use this to continue working in an existing notebook file.
@@ -566,10 +597,9 @@ async def start_session_resume_notebook(notebook_path: str) -> Dict[str, Any]:
 
 @mcp.tool
 async def start_session_continue_notebook(
-    notebook_path: str, experiment_name: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Start a session by continuing from an existing notebook (creates a new notebook file).
+    notebook_path: str, experiment_name: str | None = None
+) -> dict[str, Any]:
+    """Start a session by continuing from an existing notebook (creates a new notebook file).
 
     This creates a new notebook with "_continued" suffix, copies all cells from the existing
     notebook, and executes them to restore the kernel state. The original notebook is unchanged.
@@ -601,9 +631,8 @@ async def start_session_continue_notebook(
 @mcp.tool
 async def execute_code(
     session_id: str, code: str
-) -> List[Union[Dict[str, Any], Image]]:
-    """
-    Execute Python code in the specified kernel session.
+) -> list[dict[str, Any] | Image]:
+    """Execute Python code in the specified kernel session.
 
     Images generated during execution (e.g., via .show()) are returned as
     fastmcp.Image objects that can be directly viewed.
@@ -642,9 +671,8 @@ async def execute_code(
             save_images_locally=False,
         )
 
-
         # Create result list with execution metadata first, then images
-        result: list[Dict[str, Any] | Image] = [
+        result: list[dict[str, Any] | Image] = [
             {
                 "session_id": session_id,
                 "execution_count": data["execution_count"],
@@ -659,9 +687,8 @@ async def execute_code(
 
 
 @mcp.tool
-async def add_markdown(session_id: str, content: str) -> Dict[str, int]:
-    """
-    Add a markdown cell to the notebook for documentation.
+async def add_markdown(session_id: str, content: str) -> dict[str, int]:
+    """Add a markdown cell to the notebook for documentation.
 
     Args:
         session_id: The session ID
@@ -682,7 +709,6 @@ async def add_markdown(session_id: str, content: str) -> Dict[str, int]:
         )
         data = _check_response(response, f"add markdown in session {session_id}")
 
-
         return {"cell_number": data["cell_number"]}
 
     except requests.exceptions.RequestException as e:
@@ -692,9 +718,8 @@ async def add_markdown(session_id: str, content: str) -> Dict[str, int]:
 @mcp.tool
 async def edit_cell(
     session_id: str, code: str, cell_index: int = -1
-) -> List[Union[Dict[str, Any], Image]]:
-    """
-    Edit an existing code cell in the notebook and execute the new code.
+) -> list[dict[str, Any] | Image]:
+    """Edit an existing code cell in the notebook and execute the new code.
 
     This is especially useful for fixing errors or modifying the most recent cell.
 
@@ -733,9 +758,8 @@ async def edit_cell(
             save_images_locally=False,
         )
 
-
         # Create result list with execution metadata first, then images
-        result: list[Dict[str, Any] | Image] = [
+        result: list[dict[str, Any] | Image] = [
             {
                 "session_id": session_id,
                 "cell_index": data["cell_index"],
@@ -753,8 +777,7 @@ async def edit_cell(
 
 @mcp.tool
 async def shutdown_session(session_id: str) -> str:
-    """
-    Shutdown a kernel session gracefully.
+    """Shutdown a kernel session gracefully.
 
     Note: using this tool terminates kernel state; it should typically only be used if the user
     has instructured you to do so.
@@ -775,7 +798,7 @@ async def shutdown_session(session_id: str) -> str:
 
         # Clean up session tracking
         global _active_sessions
-        _active_sessions.discard(session_id)
+        _active_sessions.pop(session_id, None)
 
         # Persist state for recovery after compaction
         save_state()
@@ -787,12 +810,10 @@ async def shutdown_session(session_id: str) -> str:
 
 
 @mcp.tool
-async def list_sessions() -> Dict[str, Any]:
-    """
-    List all active notebook sessions.
+async def list_sessions() -> dict[str, Any]:
+    """List all active notebook sessions with their metadata.
 
-    Returns session IDs for all running sessions. Use this to find valid session_ids
-    for execute_code, add_markdown, edit_cell, etc.
+    Use this to find valid session_ids for execute_code, add_markdown, edit_cell, etc.
 
     IMPORTANT: Call this after context compaction if you've lost your session_id.
     Sessions persist across compaction - you can continue using them without resuming
@@ -803,9 +824,22 @@ async def list_sessions() -> Dict[str, Any]:
 
     Returns:
         Dictionary with:
-        - sessions: List of active session IDs (UUIDs)
+        - sessions: List of session objects, each containing:
+            - session_id: The UUID to pass to execute_code, edit_cell, etc.
+            - notebook_path: Path to the notebook file for this session
         - server_status: Current server status (URL redacted for security)
+
+    Example response:
+        {
+            "sessions": [
+                {"session_id": "abc-123-...", "notebook_path": "/path/to/notebook.ipynb"}
+            ],
+            "server_status": {...}
+        }
     """
+    # Ensure server is running and state is loaded from disk (critical after compaction)
+    ensure_server_running()
+
     status = get_server_status()
 
     # Redact auth token from vscode_url to prevent token leakage in logs/transcripts
@@ -814,7 +848,7 @@ async def list_sessions() -> Dict[str, Any]:
         status["vscode_url"] = f"{base_url}?token=<redacted>"
 
     return {
-        "sessions": list(_active_sessions),
+        "sessions": [s.model_dump() for s in _active_sessions.values()],
         "server_status": status,
     }
 
