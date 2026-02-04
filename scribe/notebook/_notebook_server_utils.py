@@ -3,27 +3,31 @@ import re
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import requests
+import structlog
 from fastmcp.utilities.types import Image
+
+logger = structlog.get_logger(__name__)
+
 from ._image_processing_utils import resize_image_if_needed
 
 
-def find_safe_port(start_port=20000, max_port=30000):
+def find_safe_port(start_port=35000, max_port=45000):
     """Find a port that's not in use by anyone.
 
     Uses random selection to minimize conflicts between users.
 
     Args:
-        start_port: Minimum port number (default: 20000)
-        max_port: Maximum port number (default: 30000)
+        start_port: Minimum port number (default: 35000)
+        max_port: Maximum port number (default: 45000)
 
     Returns:
         int: Available port number, or None if none found
     """
-    import socket
     import random
+    import socket
 
     # Try random ports first (more efficient and less likely to conflict)
     ports_to_try = list(range(start_port, max_port + 1))
@@ -54,7 +58,7 @@ def clean_notebook_for_save(nb):
     return nb
 
 
-def check_server_health(port: int) -> Optional[Dict[str, Any]]:
+def check_server_health(port: int) -> dict[str, Any] | None:
     """Check if scribe server is running on given port."""
     try:
         url = f"http://127.0.0.1:{port}/api/scribe/health"
@@ -67,7 +71,7 @@ def check_server_health(port: int) -> Optional[Dict[str, Any]]:
 
 
 def start_scribe_server(
-    port: int, token: str, notebook_output_dir: Optional[str] = None
+    port: int, token: str, notebook_output_dir: str | None = None
 ) -> subprocess.Popen:
     """Start a Scribe Jupyter server subprocess.
 
@@ -136,7 +140,7 @@ def cleanup_scribe_server(process: subprocess.Popen) -> None:
         process: The server process to clean up
     """
     if process:
-        print("Shutting down managed Jupyter server...", file=sys.stderr)
+        logger.info("shutting_down_managed_jupyter_server")
         process.terminate()
         try:
             process.wait(timeout=5)
@@ -146,11 +150,11 @@ def cleanup_scribe_server(process: subprocess.Popen) -> None:
 
 
 def process_jupyter_outputs(
-    outputs: List[Dict[str, Any]],
-    session_id: Optional[str] = None,
+    outputs: list[dict[str, Any]],
+    session_id: str | None = None,
     save_images_locally: bool = False,
-    provider: str = None,
-) -> Tuple[List[Dict[str, Any]], List[Image]]:
+    provider: str | None = None,
+) -> tuple[list[dict[str, Any]], list[Image]]:
     """Process Jupyter notebook outputs into MCP format.
 
     Args:

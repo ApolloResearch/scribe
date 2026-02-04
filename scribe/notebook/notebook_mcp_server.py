@@ -1,45 +1,255 @@
-"""
-Scribe Notebook MCP Server - Model Context Protocol interface for agents to work with
+"""Scribe Notebook MCP Server - Model Context Protocol interface for agents to work with
 the Scribe notebook server. MCP endpoints are easier for agents to interact with than
 raw HTTP requests or Jupyter Server API calls.
 """
 
+__all__ = [
+    # Public API
+    "SessionInfo",
+    "ServerStatus",
+    "ensure_server_running",
+    "get_token",
+    "save_state",
+    "load_state",
+    "clear_state",
+    "check_jupyter_status",
+    "is_jupyter_alive",
+    # For testing
+    "_get_state_file",
+]
+
 import atexit
+import hashlib
+import json
 import os
 import secrets
 import signal
 import subprocess
 import sys
-from typing import Dict, Any, Optional, List, Union
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any
 
 import requests
+import structlog
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
+from pydantic import BaseModel
+
+logger = structlog.get_logger(__name__)
 
 from scribe.notebook._notebook_server_utils import (
-    find_safe_port,
     check_server_health,
-    start_scribe_server,
     cleanup_scribe_server,
+    find_safe_port,
     process_jupyter_outputs,
+    start_scribe_server,
 )  # noqa: E402
-
 
 # Initialize MCP server
 mcp = FastMCP("scribe")
 
+
+class SessionInfo(BaseModel):
+    """Metadata for an active notebook session, persisted across compaction."""
+
+    session_id: str
+    notebook_path: str
+
+
+def _check_response(response: requests.Response, operation: str) -> dict:
+    """Check HTTP response and return JSON data, raising with server error message on failure.
+
+    Args:
+        response: The requests Response object
+        operation: Description of the operation for error messages (e.g., "start session")
+
+    Returns:
+        The JSON response data (empty dict if response has no content)
+
+    Raises:
+        Exception: With the actual server error message if request failed
+    """
+    if not response.ok:
+        # Try to extract error message from JSON with common error field names
+        try:
+            error_data = response.json()
+            # Check multiple common error fields
+            error_msg = (
+                error_data.get("error")
+                or error_data.get("detail")
+                or error_data.get("message")
+                or response.text
+            )
+        except Exception:
+            error_msg = response.text or "No error details"
+        raise Exception(f"Failed to {operation} (HTTP {response.status_code}): {error_msg}")
+
+    # Handle empty/non-JSON success responses (e.g., 204 No Content)
+    if not response.content:
+        return {}
+
+    try:
+        return response.json()
+    except Exception:
+        # If response isn't JSON, return empty dict rather than crashing
+        return {}
+
+
 # Global server management
-_server_process: Optional[subprocess.Popen] = None
-_server_port: Optional[int] = None
-_server_url: Optional[str] = None
-_server_token: Optional[str] = None
+_server_process: subprocess.Popen | None = None
+_server_port: int | None = None
+_server_url: str | None = None
+_server_token: str | None = None
 # Down the line, we may wish to keep the Jupyter server around even after MCP server exits
 _is_external_server: bool = False
 
-SCRIBE_PROVIDER: str = os.environ.get("SCRIBE_PROVIDER")
+SCRIBE_PROVIDER: str | None = os.environ.get("SCRIBE_PROVIDER")
 
-# Session tracking for cleanup
-_active_sessions: set = set()
+# Session tracking for cleanup - maps session_id to SessionInfo
+_active_sessions: dict[str, SessionInfo] = {}
+
+
+# ============================================================================
+# State Persistence (for surviving Claude Code compaction)
+# ============================================================================
+
+
+def _get_state_file() -> Path:
+    """Get state file path unique to current working directory AND session.
+
+    This allows:
+    - Multiple Claude Code instances in different directories to have separate sessions
+    - Concurrent scribe sessions in the SAME directory to have separate state files
+    - Same session after compaction to reconnect to its own Jupyter server
+
+    Raises:
+        RuntimeError: If SCRIBE_SESSION_ID is not set (MCP server must be invoked via scribe CLI)
+    """
+    session_id = os.environ.get("SCRIBE_SESSION_ID")
+    if not session_id:
+        raise RuntimeError(
+            "SCRIBE_SESSION_ID environment variable is required. "
+            "The MCP server must be invoked via the scribe CLI (e.g., 'scribe claude'), "
+            "which sets this variable automatically."
+        )
+
+    cwd_hash = hashlib.md5(os.getcwd().encode()).hexdigest()[:8]
+    # Include first 8 chars of session_id for uniqueness
+    state_file = Path.home() / f".scribe_state_{cwd_hash}_{session_id[:8]}.json"
+    logger.info("using_state_file", state_file=str(state_file))
+    return state_file
+
+
+def save_state() -> None:
+    """Persist current MCP server state to disk for recovery after compaction.
+
+    Uses atomic write (write to temp file then rename) and sets restrictive
+    permissions (0o600) since the state file contains the Jupyter auth token.
+    """
+    global _server_port, _server_token, _server_url, _server_process, _active_sessions
+
+    state = {
+        "version": 2,  # Bumped version for new session format with notebook paths
+        "server": {
+            "port": _server_port,
+            "token": _server_token,
+            "pid": _server_process.pid if _server_process else None,
+            "url": _server_url,
+        },
+        "sessions": [s.model_dump() for s in _active_sessions.values()],
+        "updated_at": datetime.now().isoformat(),
+    }
+    state_file = _get_state_file()
+    temp_file = state_file.with_suffix(".tmp")
+    try:
+        # Write to temp file first
+        temp_file.write_text(json.dumps(state, indent=2))
+        # Set restrictive permissions (owner read/write only) - token is sensitive
+        os.chmod(temp_file, 0o600)
+        # Atomic rename
+        os.replace(temp_file, state_file)
+    except OSError as e:
+        logger.warning("failed_to_save_state", error=str(e))
+        # Clean up temp file if it exists
+        try:
+            temp_file.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def load_state() -> dict | None:
+    """Load persisted state from disk if it exists."""
+    state_file = _get_state_file()
+    if state_file.exists():
+        try:
+            return json.loads(state_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def clear_state() -> None:
+    """Remove state file (used when server is confirmed dead)."""
+    try:
+        state_file = _get_state_file()
+        if state_file.exists():
+            state_file.unlink()
+    except (OSError, RuntimeError):
+        # RuntimeError: SCRIBE_SESSION_ID not set (can happen during atexit cleanup)
+        # OSError: file operation failed
+        pass
+
+
+class ServerStatus(Enum):
+    """Status of a Jupyter server health check."""
+
+    HEALTHY = "healthy"  # Server responded successfully
+    UNAUTHORIZED = "unauthorized"  # Server alive but rejected auth (401/403)
+    UNREACHABLE = "unreachable"  # Connection refused/timeout
+
+
+def check_jupyter_status(port: int, token: str) -> ServerStatus:
+    """Check Jupyter server status with auth differentiation.
+
+    Distinguishes between:
+    - HEALTHY: Server is responding and accepting our token
+    - UNAUTHORIZED: Server is alive but rejecting our token (401/403)
+    - UNREACHABLE: Server is not responding (connection refused, timeout, etc.)
+
+    This distinction is important because an UNAUTHORIZED response means the server
+    is still running (just with a different token), while UNREACHABLE means it's dead.
+    """
+    try:
+        headers = {"Authorization": f"token {token}"} if token else {}
+        response = requests.get(
+            f"http://127.0.0.1:{port}/api/scribe/health",
+            headers=headers,
+            timeout=2,
+        )
+        if response.status_code == 200:
+            return ServerStatus.HEALTHY
+        elif response.status_code in (401, 403):
+            return ServerStatus.UNAUTHORIZED
+        else:
+            return ServerStatus.UNREACHABLE
+    except requests.RequestException:
+        return ServerStatus.UNREACHABLE
+
+
+def is_jupyter_alive(port: int, token: str) -> bool:
+    """Check if a Jupyter server is responding at the given port with the given token.
+
+    This is a backwards-compatible wrapper around check_jupyter_status that returns
+    a simple boolean (True only if HEALTHY).
+    """
+    return check_jupyter_status(port, token) == ServerStatus.HEALTHY
+
+
+# ============================================================================
+# Server Management
+# ============================================================================
 
 
 def start_jupyter_server() -> tuple[subprocess.Popen, int, str]:
@@ -68,24 +278,83 @@ def cleanup_server():
     if _server_process and not _is_external_server:
         cleanup_scribe_server(_server_process)
         _server_process = None
-        _server_token = None  # Clear token on cleanup
+        _server_token = None
+        clear_state()  # Remove state file pointing to now-dead server
 
 
 def ensure_server_running() -> str:
     """Ensure a Jupyter server is running and return its URL."""
-    global _server_process, _server_port, _server_url, _is_external_server
+    global _server_process, _server_port, _server_url, _server_token, _is_external_server, _active_sessions
 
     # Check if SCRIBE_PORT is set (external server)
     if "SCRIBE_PORT" in os.environ:
         port = os.environ["SCRIBE_PORT"]
         _server_port = int(port)
         _server_url = f"http://127.0.0.1:{port}"
+        # Support SCRIBE_TOKEN for external server authentication
+        _server_token = os.environ.get("SCRIBE_TOKEN", "")
         _is_external_server = True
+
+        # Optionally verify external server is reachable
+        if _server_token:
+            status = check_jupyter_status(_server_port, _server_token)
+            if status != ServerStatus.HEALTHY:
+                print(
+                    f"[scribe] Warning: External server at port {port} returned {status.value}",
+                    file=sys.stderr,
+                )
+
         return _server_url
 
     # Check if our managed server is still running
     if _server_process and _server_process.poll() is None:
+        assert _server_url is not None  # Set when server started
         return _server_url
+
+    # Try to restore from persisted state (survives Claude Code compaction)
+    state = load_state()
+    if state and state.get("server", {}).get("port"):
+        saved_port = state["server"]["port"]
+        saved_token = state["server"]["token"]
+
+        if saved_token:
+            status = check_jupyter_status(saved_port, saved_token)
+            if status == ServerStatus.HEALTHY:
+                print(
+                    f"[scribe] Reconnected to existing Jupyter server at port {saved_port}",
+                    file=sys.stderr,
+                )
+                _server_port = saved_port
+                _server_token = saved_token
+                _server_url = f"http://127.0.0.1:{saved_port}"
+                # Restore sessions - handle both old format (list of IDs) and new format (list of dicts)
+                saved_sessions = state.get("sessions", [])
+                _active_sessions = {}
+                for s in saved_sessions:
+                    if isinstance(s, dict):
+                        info = SessionInfo(**s)
+                        _active_sessions[info.session_id] = info
+                    elif isinstance(s, str):
+                        # Legacy format: just session ID, no notebook path
+                        _active_sessions[s] = SessionInfo(session_id=s, notebook_path="")
+                _is_external_server = False  # We started it, but don't have process handle
+                # Note: _server_process stays None since we don't own the process handle anymore
+                return _server_url
+            elif status == ServerStatus.UNAUTHORIZED:
+                print(
+                    f"[scribe] Saved Jupyter server (port {saved_port}) rejected auth token, starting new one",
+                    file=sys.stderr,
+                )
+                clear_state()
+            else:  # UNREACHABLE
+                print(
+                    f"[scribe] Saved Jupyter server (port {saved_port}) is dead, starting new one",
+                    file=sys.stderr,
+                )
+                clear_state()
+        else:
+            # No token in saved state - clear and start fresh
+            clear_state()
 
     # Start a new managed server
     _is_external_server = False
@@ -93,10 +362,14 @@ def ensure_server_running() -> str:
 
     # Register cleanup handlers
     atexit.register(cleanup_server)
-    signal.signal(signal.SIGTERM, lambda sig, frame: cleanup_server())
-    signal.signal(signal.SIGINT, lambda sig, frame: cleanup_server())
+    signal.signal(signal.SIGTERM, lambda _sig, _frame: cleanup_server())
+    signal.signal(signal.SIGINT, lambda _sig, _frame: cleanup_server())
 
-    print(f"Started managed Jupyter server at {_server_url}", file=sys.stderr)
+    logger.info("started_managed_jupyter_server", url=_server_url)
+
+    # Persist state for recovery after compaction
+    save_state()
+
     return _server_url
 
 
@@ -108,7 +381,7 @@ def get_token() -> str:
     return _server_token or ""
 
 
-def get_server_status() -> Dict[str, Any]:
+def get_server_status() -> dict[str, Any]:
     """Get current server status information."""
     global _server_port, _server_url, _is_external_server, _server_process
 
@@ -144,13 +417,12 @@ def get_server_status() -> Dict[str, Any]:
 
 
 async def _start_session_internal(
-    experiment_name: Optional[str] = None,
-    notebook_path: Optional[str] = None,
+    experiment_name: str | None = None,
+    notebook_path: str | None = None,
     fork_prev_notebook: bool = True,
     tool_name: str = "start_session",
-) -> Dict[str, Any]:
-    """
-    Internal helper function for starting sessions from scratch versus resuming versus forking existing notebook.
+) -> dict[str, Any]:
+    """Internal helper function for starting sessions from scratch versus resuming versus forking existing notebook.
 
     Args:
         experiment_name: Custom name for the notebook
@@ -173,13 +445,12 @@ async def _start_session_internal(
         # Start session
         token = get_token()
         headers = {"Authorization": f"token {token}"} if token else {}
-        print(f"[DEBUG MCP] {tool_name}: Connecting to {server_url}", file=sys.stderr)
+        logger.debug("mcp_connecting", tool=tool_name, server_url=server_url)
 
         response = requests.post(
             f"{server_url}/api/scribe/start", json=request_body, headers=headers
         )
-        response.raise_for_status()
-        data = response.json()
+        data = _check_response(response, "start session")
 
         result = {
             "session_id": data["session_id"],
@@ -194,7 +465,13 @@ async def _start_session_internal(
 
         # Track session for cleanup
         global _active_sessions
-        _active_sessions.add(data["session_id"])
+        _active_sessions[data["session_id"]] = SessionInfo(
+            session_id=data["session_id"],
+            notebook_path=data["notebook_path"],
+        )
+
+        # Persist state for recovery after compaction
+        save_state()
 
         # Handle restoration results if present (only for notebook-based sessions)
         if notebook_path:
@@ -263,9 +540,8 @@ async def _start_session_internal(
 
 
 @mcp.tool
-async def start_new_session(experiment_name: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Start a completely new Jupyter kernel session with an empty notebook.
+async def start_new_session(experiment_name: str | None = None) -> dict[str, Any]:
+    """Start a completely new Jupyter kernel session with an empty notebook.
 
     Args:
         experiment_name: Custom name for the notebook (e.g., "ImageGeneration")
@@ -295,9 +571,8 @@ async def start_new_session(experiment_name: Optional[str] = None) -> Dict[str, 
         "title": "Start Session - Resume Notebook"  # A human-readable title for the tool.
     },
 )
-async def start_session_resume_notebook(notebook_path: str) -> Dict[str, Any]:
-    """
-    Start a new session by resuming an existing notebook in-place, modifying the original notebook file.
+async def start_session_resume_notebook(notebook_path: str) -> dict[str, Any]:
+    """Start a new session by resuming an existing notebook in-place, modifying the original notebook file.
 
     This executes all cells in the existing notebook to restore the kernel state and updates
     the notebook file with new outputs. Use this to continue working in an existing notebook file.
@@ -327,10 +602,9 @@ async def start_session_resume_notebook(notebook_path: str) -> Dict[str, Any]:
 
 @mcp.tool
 async def start_session_continue_notebook(
-    notebook_path: str, experiment_name: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Start a session by continuing from an existing notebook (creates a new notebook file).
+    notebook_path: str, experiment_name: str | None = None
+) -> dict[str, Any]:
+    """Start a session by continuing from an existing notebook (creates a new notebook file).
 
     This creates a new notebook with "_continued" suffix, copies all cells from the existing
     notebook, and executes them to restore the kernel state. The original notebook is unchanged.
@@ -362,15 +636,18 @@ async def start_session_continue_notebook(
 @mcp.tool
 async def execute_code(
     session_id: str, code: str
-) -> List[Union[Dict[str, Any], Image]]:
-    """
-    Execute Python code in the specified kernel session.
+) -> list[dict[str, Any] | Image]:
+    """Execute Python code in the specified kernel session.
 
     Images generated during execution (e.g., via .show()) are returned as
     fastmcp.Image objects that can be directly viewed.
 
+    IMPORTANT: Sessions persist across context compaction. If you lose your session_id
+    (e.g., after compaction), use list_sessions to find active sessions you can continue using.
+    You do NOT need to resume the notebook - just use the session_id from list_sessions.
+
     Args:
-        session_id: The session ID returned by start_session
+        session_id: The session ID returned by start_session (or from list_sessions)
         code: Python code to execute
 
     Returns:
@@ -390,8 +667,7 @@ async def execute_code(
             json={"session_id": session_id, "code": code},
             headers=headers,
         )
-        response.raise_for_status()
-        data = response.json()
+        data = _check_response(response, f"execute code in session {session_id}")
 
         # Process outputs using utils function
         outputs, images = process_jupyter_outputs(
@@ -400,9 +676,8 @@ async def execute_code(
             save_images_locally=False,
         )
 
-
         # Create result list with execution metadata first, then images
-        result = [
+        result: list[dict[str, Any] | Image] = [
             {
                 "session_id": session_id,
                 "execution_count": data["execution_count"],
@@ -417,9 +692,8 @@ async def execute_code(
 
 
 @mcp.tool
-async def add_markdown(session_id: str, content: str) -> Dict[str, int]:
-    """
-    Add a markdown cell to the notebook for documentation.
+async def add_markdown(session_id: str, content: str) -> dict[str, int]:
+    """Add a markdown cell to the notebook for documentation.
 
     Args:
         session_id: The session ID
@@ -438,9 +712,7 @@ async def add_markdown(session_id: str, content: str) -> Dict[str, int]:
             json={"session_id": session_id, "content": content},
             headers=headers,
         )
-        response.raise_for_status()
-        data = response.json()
-
+        data = _check_response(response, f"add markdown in session {session_id}")
 
         return {"cell_number": data["cell_number"]}
 
@@ -451,9 +723,8 @@ async def add_markdown(session_id: str, content: str) -> Dict[str, int]:
 @mcp.tool
 async def edit_cell(
     session_id: str, code: str, cell_index: int = -1
-) -> List[Union[Dict[str, Any], Image]]:
-    """
-    Edit an existing code cell in the notebook and execute the new code.
+) -> list[dict[str, Any] | Image]:
+    """Edit an existing code cell in the notebook and execute the new code.
 
     This is especially useful for fixing errors or modifying the most recent cell.
 
@@ -483,8 +754,7 @@ async def edit_cell(
             json={"session_id": session_id, "code": code, "cell_index": cell_index},
             headers=headers,
         )
-        response.raise_for_status()
-        data = response.json()
+        data = _check_response(response, f"edit cell in session {session_id}")
 
         # Process outputs using utils function
         outputs, images = process_jupyter_outputs(
@@ -493,9 +763,8 @@ async def edit_cell(
             save_images_locally=False,
         )
 
-
         # Create result list with execution metadata first, then images
-        result = [
+        result: list[dict[str, Any] | Image] = [
             {
                 "session_id": session_id,
                 "cell_index": data["cell_index"],
@@ -513,8 +782,7 @@ async def edit_cell(
 
 @mcp.tool
 async def shutdown_session(session_id: str) -> str:
-    """
-    Shutdown a kernel session gracefully.
+    """Shutdown a kernel session gracefully.
 
     Note: using this tool terminates kernel state; it should typically only be used if the user
     has instructured you to do so.
@@ -531,14 +799,63 @@ async def shutdown_session(session_id: str) -> str:
             json={"session_id": session_id},
             headers=headers,
         )
-        response.raise_for_status()
+        _check_response(response, f"shutdown session {session_id}")
 
-        # Clean up session images if image saving is enabled
+        # Clean up session tracking
         global _active_sessions
+        _active_sessions.pop(session_id, None)
+
+        # Persist state for recovery after compaction
+        save_state()
+
         return f"Session {session_id} shut down successfully"
 
     except requests.exceptions.RequestException as e:
         raise Exception(f"Failed to shutdown session: {str(e)}")
+
+
+@mcp.tool
+async def list_sessions() -> dict[str, Any]:
+    """List all active notebook sessions with their metadata.
+
+    Use this to find valid session_ids for execute_code, add_markdown, edit_cell, etc.
+
+    IMPORTANT: Call this after context compaction if you've lost your session_id.
+    Sessions persist across compaction - you can continue using them without resuming
+    the notebook. Just get the session_id from this function and pass it to execute_code.
+
+    Note: Session IDs returned may include stale sessions if kernels have died. These
+    are best-effort and will fail gracefully if used.
+
+    Returns:
+        Dictionary with:
+        - sessions: List of session objects, each containing:
+            - session_id: The UUID to pass to execute_code, edit_cell, etc.
+            - notebook_path: Path to the notebook file for this session
+        - server_status: Current server status (URL redacted for security)
+
+    Example response:
+        {
+            "sessions": [
+                {"session_id": "abc-123-...", "notebook_path": "/path/to/notebook.ipynb"}
+            ],
+            "server_status": {...}
+        }
+    """
+    # Ensure server is running and state is loaded from disk (critical after compaction)
+    ensure_server_running()
+
+    status = get_server_status()
+
+    # Redact auth token from vscode_url to prevent token leakage in logs/transcripts
+    if status.get("vscode_url") and "?token=" in status["vscode_url"]:
+        base_url = status["vscode_url"].split("?token=")[0]
+        status["vscode_url"] = f"{base_url}?token=<redacted>"
+
+    return {
+        "sessions": [s.model_dump() for s in _active_sessions.values()],
+        "server_status": status,
+    }
 
 
 @mcp.resource(
